@@ -1,0 +1,8 @@
+streamlit
+openai
+python-dotenv
+newspaper3k
+textblob
+nltk
+boto3
+lxml[html_clean]
