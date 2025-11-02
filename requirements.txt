@@ -2,7 +2,7 @@ streamlit
 openai
 python-dotenv
 newspaper3k
-textblob==0.17.1
+textblob
 nltk
 boto3
 lxml[html_clean]
