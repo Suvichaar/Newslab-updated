@@ -26,7 +26,7 @@ load_dotenv()
 #   1) nested sections (recommended):
 #      [azure_openai] AZURE_API_KEY=..., etc.
 #      [azure_speech] ...
-#      [azure] AZURE_TTS_URL=...
+#      [azure] ...
 #      [aws] AWS_* ...
 #   2) flat keys for compatibility (AZURE_API_KEY=..., AWS_ACCESS_KEY=..., etc.)
 def _get(s: dict, section: str, key: str, default=None):
@@ -36,24 +36,16 @@ def _get(s: dict, section: str, key: str, default=None):
     # flat fallback
     return s.get(key, default)
 
-# --- Azure OpenAI (from secrets) ---
+# --- Azure OpenAI (for text tasks) ---
 AZURE_API_KEY     = _get(st.secrets, "azure_openai", "AZURE_API_KEY")
 AZURE_ENDPOINT    = _get(st.secrets, "azure_openai", "AZURE_ENDPOINT")
 AZURE_DEPLOYMENT  = _get(st.secrets, "azure_openai", "AZURE_DEPLOYMENT", "gpt-5-chat")
 AZURE_API_VERSION = _get(st.secrets, "azure_openai", "AZURE_API_VERSION", "2025-01-01-preview")
 
-# --- Azure Speech (fallback) ---
+# --- Azure Speech (TTS primary) ---
 AZURE_SPEECH_KEY    = _get(st.secrets, "azure_speech", "AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = _get(st.secrets, "azure_speech", "AZURE_SPEECH_REGION", "eastus")
 DEFAULT_VOICE       = _get(st.secrets, "azure_speech", "VOICE_NAME", "en-IN-AaravNeural")
-
-# --- Custom TTS microservice or Azure OpenAI Audio TTS URL ---
-# If you set your microservice URL here, it will be used.
-# If left empty, we default to Azure OpenAI Audio TTS endpoint for the SAME deployment name.
-AZURE_TTS_URL = _get(
-    st.secrets, "azure", "AZURE_TTS_URL",
-    f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/audio/speech?api-version=2025-04-01-preview"
-)
 
 # --- AWS (from secrets) ---
 AWS_ACCESS_KEY = _get(st.secrets, "aws", "AWS_ACCESS_KEY")
@@ -66,6 +58,8 @@ CDN_PREFIX_MEDIA = "https://media.suvichaar.org/"
 
 if not S3_PREFIX.endswith("/"):
     S3_PREFIX += "/"
+if CDN_BASE and not CDN_BASE.endswith("/"):
+    CDN_BASE += "/"
 
 # --- Boto3 S3 client ---
 s3_client = boto3.client(
@@ -94,32 +88,10 @@ def _raise_if_bad(resp: requests.Response, context: str):
         raise
 
 # =========================
-# 🔊 Voice selection
+# 🔊 Voice selection (locked to a supported voice)
 # =========================
-def pick_voice_for_language(lang_code: str, default_voice: str = DEFAULT_VOICE) -> str:
-    if not lang_code:
-        return default_voice
-    l = lang_code.lower()
-    if l.startswith("hi"):
-        return "hi-IN-AaravNeural"
-    if l.startswith("en-in"):
-        return "en-IN-NeerjaNeural"
-    if l.startswith("en"):
-        return "en-IN-AaravNeural"
-    if l.startswith("bn"):
-        return "bn-IN-BashkarNeural"
-    if l.startswith("ta"):
-        return "ta-IN-PallaviNeural"
-    if l.startswith("te"):
-        return "te-IN-ShrutiNeural"
-    if l.startswith("mr"):
-        return "mr-IN-AarohiNeural"
-    if l.startswith("gu"):
-        return "gu-IN-DhwaniNeural"
-    if l.startswith("kn"):
-        return "kn-IN-SapnaNeural"
-    if l.startswith("pa"):
-        return "pa-IN-GeetikaNeural"
+def pick_voice_for_language(_: str, default_voice: str = DEFAULT_VOICE) -> str:
+    # Always use a known-good voice to avoid unsupported/region errors
     return default_voice
 
 # =========================
@@ -282,54 +254,37 @@ def restructure_slide_output_for_tts(slides: list) -> OrderedDict:
     return out
 
 # =========================
-# 🔉 Azure Speech fallback (optional)
+# 🔉 Azure Speech TTS (primary)
 # =========================
-def azure_speech_fallback_tts(text: str, voice_name: str) -> bytes:
-    # Standard SSML → Speech service
-    ssml = f"<speak version='1.0' xml:lang='en-US'><voice name='{voice_name}'>{text}</voice></speak>"
+def speech_tts_ssml(text: str, voice_name: str) -> bytes:
+    """
+    Synthesize with Azure Speech Service.
+    Endpoint: https://<region>.tts.speech.microsoft.com/cognitiveservices/v1
+    Returns raw MP3 bytes.
+    """
+    def esc(s: str) -> str:
+        # minimal SSML escaping
+        return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+    # Use an en-IN voice by default; adjust xml:lang if you switch to other locales
+    ssml = f"""<speak version="1.0" xml:lang="en-IN">
+  <voice name="{voice_name}">{esc(text)}</voice>
+</speak>"""
+
     url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
         "X-Microsoft-OutputFormat": "audio-48khz-192kbitrate-mono-mp3",
         "Content-Type": "application/ssml+xml",
+        "User-Agent": "suvichaar-tts",
     }
-    resp = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60)
-    _raise_if_bad(resp, "Azure Speech fallback")
+    resp = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=90)
+    _raise_if_bad(resp, "Azure Speech TTS")
     return resp.content
 
 # =========================
-# 🔉 TTS uploader (Azure OpenAI Audio TTS or custom microservice) + fallback
+# 🔉 TTS uploader (Speech only)
 # =========================
-def _call_primary_tts(text: str, voice: str) -> bytes:
-    """
-    Primary path:
-      - If AZURE_TTS_URL points to Azure OpenAI Audio TTS:
-          POST .../openai/deployments/<deploy>/audio/speech?api-version=2025-04-01-preview
-          body: {"input":"...", "voice":"alloy|<voice>", "format":"mp3"}
-          headers: api-key + Accept: audio/mpeg
-      - Else: treat as custom microservice: {"model":"tts-1-hd","input":text,"voice":voice}
-    Returns raw audio bytes.
-    """
-    is_azure_audio_tts = ("/openai/deployments/" in AZURE_TTS_URL) and ("/audio/speech" in AZURE_TTS_URL)
-
-    headers = {"Content-Type": "application/json"}
-    payload = {}
-    if is_azure_audio_tts:
-        headers["api-key"] = AZURE_API_KEY
-        headers["Accept"] = "audio/mpeg"
-        payload = {"input": text, "voice": voice, "format": "mp3"}
-    else:
-        # Your microservice contract (adjust if needed)
-        headers["api-key"] = AZURE_API_KEY  # if your microservice expects it; otherwise remove
-        payload = {"model": "tts-1-hd", "input": text, "voice": voice}
-
-    resp = requests.post(AZURE_TTS_URL, headers=headers, json=payload, timeout=90)
-    _raise_if_bad(resp, "TTS call")
-
-    # Azure Audio TTS returns audio bytes in body with audio/mpeg content-type
-    # Microservice may also return bytes directly
-    return resp.content
-
 def synthesize_and_upload(paragraphs: dict, voice_name: str):
     """
     paragraphs structure:
@@ -342,13 +297,7 @@ def synthesize_and_upload(paragraphs: dict, voice_name: str):
     slide_index = 1
 
     def _speak_and_upload(text: str, voice: str) -> str:
-        audio_bytes = None
-        try:
-            audio_bytes = _call_primary_tts(text, voice)
-        except Exception as e:
-            st.warning(f"TTS primary call failed, using Azure Speech fallback. Reason: {e}")
-            audio_bytes = azure_speech_fallback_tts(text, voice)
-
+        audio_bytes = speech_tts_ssml(text, voice)
         filename = f"tts_{uuid.uuid4().hex}.mp3"
         local_path = os.path.join("temp", filename)
         with open(local_path, "wb") as f:
@@ -551,8 +500,10 @@ with tab2:
     st.title("🎙️ Text-to-Speech → S3")
     uploaded_file = st.file_uploader("Upload structured slide JSON", type=["json"])
 
-    voice_lang = st.selectbox("Narration Language", ["hi-IN", "en-IN", "en-US", "bn-IN", "ta-IN", "te-IN", "mr-IN", "gu-IN", "kn-IN", "pa-IN"])
-    chosen_voice = pick_voice_for_language(voice_lang)
+    # Voice is locked; UI shown only for consistency
+    voice_lang = st.selectbox("Narration Language (locked)", ["en-IN (locked)"], index=0)
+    chosen_voice = pick_voice_for_language("en-IN")
+    st.info(f"Using voice: **{chosen_voice}**")
 
     if uploaded_file:
         paragraphs = json.load(uploaded_file)
