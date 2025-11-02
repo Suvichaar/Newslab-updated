@@ -1,3 +1,4 @@
+# app.py
 # =========================
 # 🔧 CONFIG: Azure + AWS
 # =========================
@@ -24,9 +25,12 @@ load_dotenv()
 # [azure_speech]
 # AZURE_SPEECH_KEY = "..."
 # AZURE_SPEECH_REGION = "eastus"
-# VOICE_NAME = "hi-IN-AaravNeural"
+# VOICE_NAME = "en-IN-AaravNeural"
 #
 # [azure]
+# # If using your own microservice, point here.
+# # If calling Azure OpenAI Audio TTS directly, use:
+# # "https://<your-openai>.cognitiveservices.azure.com/openai/deployments/<tts-deploy>/audio/speech?api-version=2025-04-01-preview"
 # AZURE_TTS_URL = "https://tts.suvichaar.org/api/speak"
 #
 # [aws]
@@ -48,8 +52,11 @@ AZURE_SPEECH_KEY    = st.secrets["azure_speech"]["AZURE_SPEECH_KEY"]
 AZURE_SPEECH_REGION = st.secrets["azure_speech"]["AZURE_SPEECH_REGION"]
 DEFAULT_VOICE       = st.secrets["azure_speech"].get("VOICE_NAME", "en-IN-AaravNeural")
 
-# --- Custom TTS microservice (optional) ---
-AZURE_TTS_URL = st.secrets.get("azure", {}).get("AZURE_TTS_URL", "https://suvichaar916497828764.cognitiveservices.azure.com/openai/deployments/gpt-4o-mini-tts/audio/speech?api-version=2025-04-01-preview")
+# --- Custom TTS microservice or Azure OpenAI Audio TTS URL ---
+AZURE_TTS_URL = st.secrets.get("azure", {}).get(
+    "AZURE_TTS_URL",
+    f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/audio/speech?api-version=2025-04-01-preview"
+)
 
 # --- AWS (from secrets) ---
 AWS_ACCESS_KEY = st.secrets["aws"]["AWS_ACCESS_KEY"]
@@ -59,6 +66,10 @@ AWS_BUCKET     = st.secrets["aws"]["AWS_BUCKET"]
 S3_PREFIX      = st.secrets["aws"].get("S3_PREFIX", "media/")
 CDN_BASE       = st.secrets["aws"]["CDN_BASE"]
 CDN_PREFIX_MEDIA = "https://media.suvichaar.org/"
+
+# Ensure prefix has trailing slash
+if not S3_PREFIX.endswith("/"):
+    S3_PREFIX = S3_PREFIX + "/"
 
 s3_client = boto3.client(
     "s3",
@@ -73,6 +84,17 @@ client = AzureOpenAI(
     api_key=AZURE_API_KEY,
     api_version=AZURE_API_VERSION
 )
+
+# =========================
+# 🛡️ HTTP error helper (prints snippet safely)
+# =========================
+def _raise_if_bad(resp: requests.Response, context: str):
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        snippet = (resp.text or "")[:600]
+        st.error(f"[{context}] HTTP {resp.status_code}\n\nResponse snippet:\n{snippet}")
+        raise
 
 # =========================
 # 🔊 Voice selection
@@ -142,7 +164,7 @@ Analyze the following news article and return:
 3. emotion
 
 Article:
-\"\"\"{text[:3000]}\"\"\"
+\"\"\"{text[:3000]}\"\"\"\n
 Return ONLY JSON with keys category, subcategory, emotion.
 """
     try:
@@ -175,7 +197,7 @@ MIN_SLIDES = 8
 MAX_SLIDES = 10
 
 def make_connected_point(headline: str, summary: str, lang: str) -> str:
-    """Slide 2 helper: one connected line to the news (no hashtags/emojis)."""
+    """Slide 2 helper: one connected line to the news (no emojis/hashtags)."""
     if (lang or "").lower().startswith("hi"):
         up = f"शीर्षक: {headline}\nसारांश: {summary}\n\nएक वाक्य में, सरल हिंदी में, हेडलाइन से जुड़ा मुख्य बिंदु लिखें (120 वर्णों से कम)।"
     else:
@@ -220,10 +242,7 @@ def build_story_struct(title, summary, article_text, content_language: str, tota
     slides = []
 
     # Slide 1: Headline
-    slides.append({
-        "title": title[:80],
-        "script": title.strip()
-    })
+    slides.append({"title": title[:80], "script": title.strip()})
 
     # Slide 2: Connected point
     slides.append({
@@ -232,7 +251,7 @@ def build_story_struct(title, summary, article_text, content_language: str, tota
     })
 
     # Slides 3..N-1: points
-    middle_needed = total_slides - 3  # because last slide is CTA
+    middle_needed = total_slides - 3  # last slide is CTA
     middle_scripts = split_article_into_chunks(article_text, middle_needed, content_language)
     for s in middle_scripts:
         slides.append({ "title": "", "script": s })
@@ -242,7 +261,6 @@ def build_story_struct(title, summary, article_text, content_language: str, tota
         "title": "Stay Connected" if not content_language.lower().startswith("hi") else "जुड़े रहें",
         "script": "For Such Content Stay Connected with Suvichar Live\n\nRead|Share|Inspire"
     })
-
     return slides
 
 def restructure_slide_output_for_tts(slides: list) -> OrderedDict:
@@ -262,7 +280,22 @@ def restructure_slide_output_for_tts(slides: list) -> OrderedDict:
     return out
 
 # =========================
-# 🔉 TTS uploader (uses your microservice)
+# 🔉 Azure Speech fallback (optional)
+# =========================
+def azure_speech_fallback_tts(text: str, voice_name: str) -> bytes:
+    ssml = f"<speak version='1.0' xml:lang='en-US'><voice name='{voice_name}'>{text}</voice></speak>"
+    url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
+    headers = {
+        "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
+        "X-Microsoft-OutputFormat": "audio-48khz-192kbitrate-mono-mp3",
+        "Content-Type": "application/ssml+xml",
+    }
+    resp = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60)
+    _raise_if_bad(resp, "Azure Speech fallback")
+    return resp.content
+
+# =========================
+# 🔉 TTS uploader (uses your microservice / Azure OpenAI Audio TTS)
 # =========================
 def synthesize_and_upload(paragraphs: dict, voice_name: str):
     """
@@ -270,37 +303,45 @@ def synthesize_and_upload(paragraphs: dict, voice_name: str):
       storytitle (string)
       s1paragraph1 ... sNparagraph1
       hookline
-    POST → AZURE_TTS_URL : {"model":"tts-1-hd","input":<text>,"voice":<voice_name>}
+    POST → AZURE_TTS_URL with Azure OpenAI key:
+      headers: {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+      body:    {"model":"tts-1-hd","input":<text>,"voice":<voice_name>}
     """
     result = OrderedDict()
     os.makedirs("temp", exist_ok=True)
     slide_index = 1
 
-    # Prefer Speech key if your TTS service validates against it; otherwise fallback to OpenAI key.
-    api_key_for_tts = AZURE_SPEECH_KEY or AZURE_API_KEY
-
     def _speak_and_upload(text: str, voice: str) -> str:
-        resp = requests.post(
-            AZURE_TTS_URL,
-            headers={"Content-Type": "application/json", "api-key": api_key_for_tts},
-            json={"model":"tts-1-hd","input":text,"voice":voice},
-            timeout=60
-        )
-        resp.raise_for_status()
+        audio_bytes = None
+        try:
+            resp = requests.post(
+                AZURE_TTS_URL,
+                headers={"Content-Type": "application/json", "api-key": AZURE_API_KEY},
+                json={"model":"tts-1-hd","input":text, "voice":voice},
+                timeout=60
+            )
+            _raise_if_bad(resp, "Custom TTS call")
+            audio_bytes = resp.content
+        except Exception as e:
+            st.warning(f"Custom TTS failed, using Azure Speech fallback. Reason: {e}")
+            audio_bytes = azure_speech_fallback_tts(text, voice)
+
         filename = f"tts_{uuid.uuid4().hex}.mp3"
         local_path = os.path.join("temp", filename)
         with open(local_path, "wb") as f:
-            f.write(resp.content)
+            f.write(audio_bytes)
         s3_key = f"{S3_PREFIX}{filename}"
         s3_client.upload_file(local_path, AWS_BUCKET, s3_key)
         os.remove(local_path)
         return f"{CDN_BASE}{s3_key}"
 
-    # Slide 1: storytitle
-    if "storytitle" in paragraphs:
+    # Slide 1: storytitle (emit audio_url1)
+    if "storytitle" in paragraphs and str(paragraphs["storytitle"]).strip():
         url = _speak_and_upload(paragraphs["storytitle"], voice_name)
         result[f"slide{slide_index}"] = {
-            "storytitle": paragraphs["storytitle"], "audio_url": url, "voice": voice_name
+            "storytitle": paragraphs["storytitle"],
+            f"audio_url{slide_index}": url,
+            "voice": voice_name
         }
         slide_index += 1
 
@@ -308,40 +349,46 @@ def synthesize_and_upload(paragraphs: dict, voice_name: str):
     i = 1
     while f"s{i}paragraph1" in paragraphs:
         text = paragraphs[f"s{i}paragraph1"]
-        url  = _speak_and_upload(text, voice_name)
-        result[f"slide{slide_index}"] = {
-            f"s{slide_index}paragraph1": text, f"audio_url{slide_index}": url, "voice": voice_name
-        }
-        slide_index += 1
+        if str(text).strip():
+            url  = _speak_and_upload(text, voice_name)
+            result[f"slide{slide_index}"] = {
+                f"s{slide_index}paragraph1": text,
+                f"audio_url{slide_index}": url,
+                "voice": voice_name
+            }
+            slide_index += 1
         i += 1
 
     # Last: hookline
-    if "hookline" in paragraphs and paragraphs["hookline"].strip():
+    if "hookline" in paragraphs and str(paragraphs["hookline"]).strip():
         url = _speak_and_upload(paragraphs["hookline"], voice_name)
         result[f"slide{slide_index}"] = {
-            f"s{slide_index}paragraph1": paragraphs["hookline"], f"audio_url{slide_index}": url, "voice": voice_name
+            f"s{slide_index}paragraph1": paragraphs["hookline"],
+            f"audio_url{slide_index}": url,
+            "voice": voice_name
         }
 
     return result
 
 # =========================
-# 🎬 Remotion input (CTA updated, neutral images)
+# 🎬 Remotion input (neutral images)
 # =========================
 def generate_remotion_input(tts_output: dict, fixed_image_url: str, author_name: str = "Suvichaar"):
     remotion_data = OrderedDict()
     slide_index = 1
 
-    # Slide 1: storytitle (if available)
-    if "slide1" in tts_output and "storytitle" in tts_output["slide1"]:
+    # Slide 1
+    if "slide1" in tts_output:
+        data = tts_output["slide1"]
         remotion_data[f"slide{slide_index}"] = {
-            f"s{slide_index}paragraph1": tts_output["slide1"]["storytitle"],
-            f"s{slide_index}audio1":     tts_output["slide1"].get("audio_url",""),
+            f"s{slide_index}paragraph1": data.get("storytitle",""),
+            f"s{slide_index}audio1":     data.get("audio_url1","") or data.get("audio_url",""),
             f"s{slide_index}image1":     fixed_image_url,
             f"s{slide_index}paragraph2": f"- {author_name}"
         }
         slide_index += 1
 
-    # The rest in order
+    # Others
     max_idx = max(int(k.replace("slide","")) for k in tts_output.keys())
     for i in range(2, max_idx+1):
         data = tts_output.get(f"slide{i}", {})
@@ -357,7 +404,6 @@ def generate_remotion_input(tts_output: dict, fixed_image_url: str, author_name:
         }
         slide_index += 1
 
-    # Save to file
     ts = int(time.time())
     filename = f"remotion_input_{ts}.json"
     with open(filename, "w", encoding="utf-8") as f:
@@ -365,7 +411,7 @@ def generate_remotion_input(tts_output: dict, fixed_image_url: str, author_name:
     return filename
 
 # =========================
-# 🔧 Tab helpers used later
+# 🔧 Tab helpers
 # =========================
 def modify_tab4_json(original_json):
     """Trim slide3.. to continuous slide2.., preserving audio."""
@@ -383,7 +429,7 @@ def modify_tab4_json(original_json):
                 audio_key = f"audio_url{slide_number}"
                 updated_json[new_key] = {
                     para_key: v,
-                    audio_key: content.get("audio_url", "") or content.get(f"audio_url{i}", ""),
+                    audio_key: content.get(f"audio_url{i}", content.get("audio_url", "")),
                     "voice": content.get("voice", "")
                 }
                 break
@@ -392,9 +438,9 @@ def modify_tab4_json(original_json):
 
 def replace_placeholders_in_html(html_text, json_data):
     storytitle = json_data.get("slide1", {}).get("storytitle", "")
-    storytitle_url = json_data.get("slide1", {}).get("audio_url", "")
+    storytitle_url = json_data.get("slide1", {}).get("audio_url1", json_data.get("slide1", {}).get("audio_url",""))
     hookline = json_data.get("slide2", {}).get("hookline", "")
-    hookline_url = json_data.get("slide2", {}).get("audio_url", "")
+    hookline_url = json_data.get("slide2", {}).get("audio_url2", json_data.get("slide2", {}).get("audio_url",""))
     html_text = html_text.replace("{{storytitle}}", storytitle)
     html_text = html_text.replace("{{storytitle_audiourl}}", storytitle_url)
     html_text = html_text.replace("{{hookline}}", hookline)
@@ -422,9 +468,8 @@ with tab1:
             with st.spinner("Analyzing the article and generating slides..."):
                 try:
                     title, summary, full_text = extract_article(url)
-                    sentiment = get_sentiment(summary or full_text)
-                    result = detect_category_and_subcategory(full_text, content_language)
-                    _ = (result["category"], result["subcategory"], result["emotion"])  # not shown but kept
+                    _ = get_sentiment(summary or full_text)  # available if you need it
+                    _ = detect_category_and_subcategory(full_text, content_language)  # not displayed here
 
                     slides = build_story_struct(
                         title=title,
@@ -526,11 +571,11 @@ with tab4:
     TEMPLATE_PATH = Path("test.html")
 
     def generate_slide(paragraph: str, audio_url: str):
-        # Neutral default slide image (no Polaris)
+        # Neutral default slide image
         return f"""
-        <amp-story-page id="c29cbf94-847a-4bb7-a4eb-47d17d8c2d5a" auto-advance-after="page-c29cbf94-847a-4bb7-a4eb-47d17d8c2d5a-background-audio" class="i-amphtml-layout-container" i-amphtml-layout="container">
+        <amp-story-page id="page-{uuid.uuid4().hex[:8]}" auto-advance-after="page-audio" class="i-amphtml-layout-container" i-amphtml-layout="container">
             <amp-story-grid-layer template="fill" class="i-amphtml-layout-container" i-amphtml-layout="container">
-                <amp-video autoplay layout="fixed" width="1" height="1" poster="" id="page-c29cbf94-847a-4bb7-a4eb-47d17d8c2d5a-background-audio" cache="google" class="i-amphtml-layout-fixed i-amphtml-layout-size-defined" style="width:1px;height:1px" i-amphtml-layout="fixed">
+                <amp-video id="page-audio" autoplay layout="fixed" width="1" height="1" poster="" cache="google" class="i-amphtml-layout-fixed i-amphtml-layout-size-defined" style="width:1px;height:1px" i-amphtml-layout="fixed">
                     <source type="audio/mpeg" src="{audio_url}">
                 </amp-video>
             </amp-story-grid-layer>
@@ -572,9 +617,7 @@ with tab4:
                     data = output_data[key]
                     para_key = f"s{slide_num}paragraph1"
                     audio_key = f"audio_url{slide_num}"
-
-                    # support either audio_url{n} or audio_url
-                    audio_url = data.get(audio_key, data.get("audio_url", ""))
+                    audio_url = data.get(audio_key, data.get("audio_url",""))
                     if para_key in data and audio_url:
                         raw = str(data[para_key]).replace("’", "'").replace('"', '&quot;')
                         paragraph = textwrap.shorten(raw, width=180, placeholder="...")
@@ -801,7 +844,7 @@ with tab5:
             # Upload page
             s3_key = f"{slug_nano}.html"
             s3_client.put_object(
-                Bucket="suvichaarstories",   # keep your publication bucket
+                Bucket="suvichaarstories",   # publication bucket
                 Key=s3_key,
                 Body=html_template.encode("utf-8"),
                 ContentType="text/html",
@@ -831,7 +874,6 @@ with tab5:
 # Tab 6 — Cover Image Request / thumbnail via Remotion
 # -------------------------
 with tab6:
-    # Initialize S3 client once (again here in case of hot-reload)
     s3 = boto3.client(
         "s3",
         aws_access_key_id=AWS_ACCESS_KEY,
@@ -859,7 +901,6 @@ with tab6:
             else:
                 text = next((v for k, v in info.items() if "paragraph" in k), "")
 
-            # support either audio_url{n} or audio_url
             audio = info.get(f"audio_url{idx}", info.get("audio_url", ""))
 
             transformed[slide_key] = {
@@ -888,7 +929,7 @@ with tab6:
                     json=transformed,
                     timeout=30
                 )
-                resp.raise_for_status()
+                _raise_if_bad(resp, "Thumbnail API")
             except requests.RequestException as err:
                 st.error(f"Thumbnail API error: {err}")
                 st.stop()
@@ -897,7 +938,6 @@ with tab6:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         key = f"{S3_PREFIX}cover_{ts}.png"
 
-        # Upload without ACL
         try:
             s3.put_object(
                 Bucket=AWS_BUCKET,
@@ -914,7 +954,6 @@ with tab6:
         st.markdown(f"[View on CDN]({cdn_url})")
         st.image(cdn_url, use_column_width=True)
 
-        # Offer JSON download
         st.download_button(
             label="⬇️ Download Transformed JSON",
             data=json.dumps(transformed, indent=2, ensure_ascii=False),
