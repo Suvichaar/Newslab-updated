@@ -303,9 +303,6 @@ def synthesize_and_upload(paragraphs: dict, voice_name: str):
       storytitle (string)
       s1paragraph1 ... sNparagraph1
       hookline
-    POST → AZURE_TTS_URL with Azure OpenAI key:
-      headers: {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
-      body:    {"model":"tts-1-hd","input":<text>,"voice":<voice_name>}
     """
     result = OrderedDict()
     os.makedirs("temp", exist_ok=True)
@@ -314,16 +311,23 @@ def synthesize_and_upload(paragraphs: dict, voice_name: str):
     def _speak_and_upload(text: str, voice: str) -> str:
         audio_bytes = None
         try:
+            # Detect Azure Audio TTS endpoint vs custom microservice
+            is_azure_audio_tts = ("/openai/deployments/" in AZURE_TTS_URL) and ("/audio/speech" in AZURE_TTS_URL)
+            payload = (
+                {"input": text, "voice": voice, "format": "mp3"}
+                if is_azure_audio_tts
+                else {"model":"tts-1-hd","input":text, "voice":voice}
+            )
             resp = requests.post(
                 AZURE_TTS_URL,
                 headers={"Content-Type": "application/json", "api-key": AZURE_API_KEY},
-                json={"model":"tts-1-hd","input":text, "voice":voice},
+                json=payload,
                 timeout=60
             )
-            _raise_if_bad(resp, "Custom TTS call")
+            _raise_if_bad(resp, "TTS call")
             audio_bytes = resp.content
         except Exception as e:
-            st.warning(f"Custom TTS failed, using Azure Speech fallback. Reason: {e}")
+            st.warning(f"TTS primary call failed, using Azure Speech fallback. Reason: {e}")
             audio_bytes = azure_speech_fallback_tts(text, voice)
 
         filename = f"tts_{uuid.uuid4().hex}.mp3"
@@ -389,20 +393,21 @@ def generate_remotion_input(tts_output: dict, fixed_image_url: str, author_name:
         slide_index += 1
 
     # Others
-    max_idx = max(int(k.replace("slide","")) for k in tts_output.keys())
-    for i in range(2, max_idx+1):
-        data = tts_output.get(f"slide{i}", {})
-        para_val = ""
-        for k,v in data.items():
-            if "paragraph1" in k:
-                para_val = v; break
-        remotion_data[f"slide{slide_index}"] = {
-            f"s{slide_index}paragraph1": para_val,
-            f"s{slide_index}audio1":     data.get(f"audio_url{i}", data.get("audio_url","")),
-            f"s{slide_index}image1":     fixed_image_url,
-            f"s{slide_index}paragraph2": f"- {author_name}"
-        }
-        slide_index += 1
+    if tts_output:
+        max_idx = max(int(k.replace("slide","")) for k in tts_output.keys() if k.startswith("slide"))
+        for i in range(2, max_idx+1):
+            data = tts_output.get(f"slide{i}", {})
+            para_val = ""
+            for k,v in data.items():
+                if "paragraph1" in k:
+                    para_val = v; break
+            remotion_data[f"slide{slide_index}"] = {
+                f"s{slide_index}paragraph1": para_val,
+                f"s{slide_index}audio1":     data.get(f"audio_url{i}", data.get("audio_url","")),
+                f"s{slide_index}image1":     fixed_image_url,
+                f"s{slide_index}paragraph2": f"- {author_name}"
+            }
+            slide_index += 1
 
     ts = int(time.time())
     filename = f"remotion_input_{ts}.json"
@@ -437,14 +442,33 @@ def modify_tab4_json(original_json):
     return updated_json
 
 def replace_placeholders_in_html(html_text, json_data):
-    storytitle = json_data.get("slide1", {}).get("storytitle", "")
-    storytitle_url = json_data.get("slide1", {}).get("audio_url1", json_data.get("slide1", {}).get("audio_url",""))
-    hookline = json_data.get("slide2", {}).get("hookline", "")
-    hookline_url = json_data.get("slide2", {}).get("audio_url2", json_data.get("slide2", {}).get("audio_url",""))
+    # Story title from slide1
+    s1 = json_data.get("slide1", {})
+    storytitle = s1.get("storytitle", "")
+    storytitle_url = s1.get("audio_url1", s1.get("audio_url",""))
+
+    # Hookline: prefer explicit 'hookline' if present on any slide; else fallback to last slide's paragraph
+    hookline = ""
+    hookline_url = ""
+    slide_nums = sorted([int(k.replace("slide","")) for k in json_data.keys() if k.startswith("slide")])
+    for sk in sorted([k for k in json_data if k.startswith("slide")], key=lambda x: int(x.replace("slide",""))):
+        if "hookline" in json_data[sk]:
+            idx = int(sk.replace("slide",""))
+            hookline = json_data[sk]["hookline"]
+            hookline_url = json_data[sk].get(f"audio_url{idx}", json_data[sk].get("audio_url",""))
+            break
+    if not hookline and slide_nums:
+        last = f"slide{slide_nums[-1]}"
+        for k,v in json_data.get(last, {}).items():
+            if "paragraph1" in k:
+                hookline = v
+                break
+        hookline_url = json_data.get(last, {}).get(f"audio_url{slide_nums[-1]}", json_data.get(last, {}).get("audio_url",""))
+
     html_text = html_text.replace("{{storytitle}}", storytitle)
-    html_text = html_text.replace("{{storytitle_audiourl}}", storytitle_url)
-    html_text = html_text.replace("{{hookline}}", hookline)
-    html_text = html_text.replace("{{hookline_audiourl}}", hookline_url)
+    html_text = html_text.replace("{{storytitle_audiourl}}", storytitle_url or "")
+    html_text = html_text.replace("{{hookline}}", hookline or "")
+    html_text = html_text.replace("{{hookline_audiourl}}", hookline_url or "")
     return html_text
 
 # =========================
@@ -893,7 +917,9 @@ with tab6:
         data = json.load(uploaded)
         transformed = {}
         for slide_key, info in data.items():
-            idx = int(slide_key.replace("slide", "")) if slide_key.startswith("slide") else 0
+            if not slide_key.startswith("slide"):
+                continue
+            idx = int(slide_key.replace("slide", ""))
             if "storytitle" in info:
                 text = info["storytitle"]
             elif "hookline" in info:
