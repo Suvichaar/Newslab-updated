@@ -26,21 +26,34 @@ load_dotenv()
 #   1) nested sections (recommended):
 #      [azure_openai] AZURE_API_KEY=..., etc.
 #      [azure_speech] ...
-#      [azure] ...
+#      [azure_dalle] ...
+#      [azure_di] ...
 #      [aws] AWS_* ...
 #   2) flat keys for compatibility (AZURE_API_KEY=..., AWS_ACCESS_KEY=..., etc.)
 def _get(s: dict, section: str, key: str, default=None):
     # nested
     if section in s and isinstance(s[section], dict) and key in s[section]:
         return s[section][key]
-    # flat fallback
-    return s.get(key, default)
+    # flat
+    if key in s:
+        return s[key]
+    # env fallback
+    return os.getenv(key, default)
 
 # --- Azure OpenAI (for text tasks) ---
 AZURE_API_KEY     = _get(st.secrets, "azure_openai", "AZURE_API_KEY")
 AZURE_ENDPOINT    = _get(st.secrets, "azure_openai", "AZURE_ENDPOINT")
 AZURE_DEPLOYMENT  = _get(st.secrets, "azure_openai", "AZURE_DEPLOYMENT", "gpt-5-chat")
 AZURE_API_VERSION = _get(st.secrets, "azure_openai", "AZURE_API_VERSION", "2025-01-01-preview")
+
+# Normalize endpoint if user pasted Cognitive Services base
+# The OpenAI SDK expects https://<resource>.openai.azure.com
+if AZURE_ENDPOINT and "cognitiveservices.azure.com" in AZURE_ENDPOINT:
+    try:
+        host = AZURE_ENDPOINT.split("https://", 1)[1].split(".cognitive", 1)[0]
+        AZURE_ENDPOINT = f"https://{host}.openai.azure.com"
+    except Exception:
+        pass  # leave as-is and let SDK error if malformed
 
 # --- Azure Speech (TTS primary) ---
 AZURE_SPEECH_KEY    = _get(st.secrets, "azure_speech", "AZURE_SPEECH_KEY")
@@ -54,12 +67,14 @@ AWS_REGION     = _get(st.secrets, "aws", "AWS_REGION", "ap-south-1")
 AWS_BUCKET     = _get(st.secrets, "aws", "AWS_BUCKET", "suvichaarapp")
 S3_PREFIX      = _get(st.secrets, "aws", "S3_PREFIX", "media/")
 CDN_BASE       = _get(st.secrets, "aws", "CDN_BASE", "https://media.suvichaar.org/")
-CDN_PREFIX_MEDIA = "https://media.suvichaar.org/"
+CDN_PREFIX_MEDIA = _get(st.secrets, "aws", "CDN_PREFIX_MEDIA", "https://media.suvichaar.org/")
 
 if not S3_PREFIX.endswith("/"):
     S3_PREFIX += "/"
 if CDN_BASE and not CDN_BASE.endswith("/"):
     CDN_BASE += "/"
+if CDN_PREFIX_MEDIA and not CDN_PREFIX_MEDIA.endswith("/"):
+    CDN_PREFIX_MEDIA += "/"
 
 # --- Boto3 S3 client ---
 s3_client = boto3.client(
@@ -70,11 +85,20 @@ s3_client = boto3.client(
 )
 
 # --- Azure OpenAI Client for text tasks ---
-client = AzureOpenAI(
-    azure_endpoint=AZURE_ENDPOINT,
-    api_key=AZURE_API_KEY,
-    api_version=AZURE_API_VERSION
-)
+# Show a clear error inside the app if creds are missing
+if not AZURE_API_KEY or not AZURE_ENDPOINT:
+    st.error("Azure OpenAI credentials missing. Ensure AZURE_API_KEY and AZURE_ENDPOINT are set (secrets or env).")
+    st.stop()
+
+try:
+    client = AzureOpenAI(
+        azure_endpoint=AZURE_ENDPOINT,
+        api_key=AZURE_API_KEY,
+        api_version=AZURE_API_VERSION
+    )
+except Exception as e:
+    st.error(f"Azure OpenAI client init failed. Check endpoint & API version.\n\nError: {e}")
+    st.stop()
 
 # =========================
 # 🛡️ HTTP error helper (prints snippet safely)
