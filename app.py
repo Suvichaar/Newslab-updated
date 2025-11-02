@@ -49,7 +49,7 @@ AZURE_SPEECH_REGION = st.secrets["azure_speech"]["AZURE_SPEECH_REGION"]
 DEFAULT_VOICE       = st.secrets["azure_speech"].get("VOICE_NAME", "en-IN-AaravNeural")
 
 # --- Custom TTS microservice (optional) ---
-AZURE_TTS_URL = st.secrets.get("azure", {}).get("AZURE_TTS_URL", "https://tts.suvichaar.org/api/speak")
+AZURE_TTS_URL = st.secrets.get("azure", {}).get("AZURE_TTS_URL", "https://suvichaar916497828764.cognitiveservices.azure.com/openai/deployments/gpt-4o-mini-tts/audio/speech?api-version=2025-04-01-preview")
 
 # --- AWS (from secrets) ---
 AWS_ACCESS_KEY = st.secrets["aws"]["AWS_ACCESS_KEY"]
