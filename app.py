@@ -36,8 +36,9 @@ DEFAULT_COVER_URL = "https://media.suvichaar.org/upload/covers/default_news.png"
 DEFAULT_SLIDE_IMAGE_URL = "https://media.suvichaar.org/upload/covers/default_news_slide.png"
 DEFAULT_CTA_AUDIO = "https://cdn.suvichaar.org/media/tts_cta_default.mp3"
 
-MIN_SLIDES = 8
-MAX_SLIDES = 10
+# Enforce total slides (Headline + main slides + Hookline). CTA is extra.
+MIN_TOTAL_SLIDES = 8
+MAX_TOTAL_SLIDES = 10
 
 # ---------- Secrets ----------
 client = AzureOpenAI(
@@ -73,8 +74,15 @@ voice_options = {
     "6": "shimmer",
 }
 
-def clamp_slide_count(n: int) -> int:
-    return max(MIN_SLIDES, min(MAX_SLIDES, int(n)))
+def clamp_main_slides(requested_main: int) -> int:
+    """
+    requested_main = slides between Headline and Hookline.
+    We clamp TOTAL slides (Headline + main + Hookline) into [8..10].
+    CTA is not counted in this min/max.
+    """
+    total = 2 + int(requested_main)  # +Headline +Hookline
+    total = max(MIN_TOTAL_SLIDES, min(MAX_TOTAL_SLIDES, total))
+    return max(0, total - 2)
 
 def generate_slug_and_urls(title: str):
     if not title or not isinstance(title, str):
@@ -110,18 +118,32 @@ def extract_article(url):
         st.error(f"❌ Failed to extract article: {e}")
         return "Untitled Article", "No summary available.", "No article content available."
 
-def get_sentiment(text):
-    from TextBlob import TextBlob  # fallback if available
-    try:
-        clean = (text or "").strip().replace("\n", " ")
-        if not clean:
-            return "neutral"
-        pol = TextBlob(clean).sentiment.polarity
-        if pol > 0.2: return "positive"
-        if pol < -0.2: return "negative"
+def get_sentiment(text: str) -> str:
+    """
+    Dependency-free lightweight heuristic sentiment.
+    Returns: 'positive' | 'negative' | 'neutral'
+    """
+    if not text or not str(text).strip():
         return "neutral"
-    except Exception:
-        return "neutral"
+    t = str(text).lower()
+
+    pos_words = {
+        "growth","improved","record","gain","surge","soar","win","wins","victory","milestone",
+        "boost","increase","expansion","positive","rise","strong","beat","beats","achieve","achieved"
+    }
+    neg_words = {
+        "decline","drop","fall","fell","loss","losses","downturn","crash","fail","failed","failure",
+        "delay","delayed","negative","fraud","scam","ban","banned","risk","risks","cut","cuts","layoff",
+        "layoffs","debt","default","crisis","crises","probe","investigation"
+    }
+
+    pos = sum(w in t for w in pos_words)
+    neg = sum(w in t for w in neg_words)
+    if pos - neg > 1:
+        return "positive"
+    if neg - pos > 1:
+        return "negative"
+    return "neutral"
 
 def detect_category_and_subcategory(text, content_language="English"):
     if not text or len(text.strip()) < 50:
@@ -216,10 +238,10 @@ Article:
 
     return {"category": category, "subcategory": subcategory, "emotion": emotion, "slides": slides}
 
-def restructure_slide_output(final_output, slide_count):
+def restructure_slide_output(final_output, main_slide_count):
     """Return dict with s1..sNparagraph1 placeholders (content only).
     We'll generate narrations per slide later."""
-    slides = final_output.get("slides", [])[:slide_count]  # clamp early
+    slides = final_output.get("slides", [])[:main_slide_count]  # clamp early
     structured = OrderedDict()
     for idx, slide in enumerate(slides, start=1):
         key = f"s{idx}paragraph1"
@@ -347,7 +369,7 @@ def synthesize_and_upload(paragraphs: dict, voice: str, add_cta=True) -> Ordered
     slide_index = 1
 
     # Slide 1 — title
-    if "storytitle" in paragraphs and paragraphs["storytitle"].strip():
+    if "storytitle" in paragraphs and str(paragraphs["storytitle"]).strip():
         audio = _upload_bytes_to_s3(_tts_bytes(paragraphs["storytitle"], voice))
         result[f"slide{slide_index}"] = {
             "storytitle": paragraphs["storytitle"],
@@ -383,7 +405,7 @@ def synthesize_and_upload(paragraphs: dict, voice: str, add_cta=True) -> Ordered
         }
         slide_index += 1
 
-    # Final CTA
+    # Final CTA (fixed text & your canned audio url)
     if add_cta:
         result[f"slide{slide_index}"] = {
             f"s{slide_index}paragraph1": "For Such Content Stay Connected with Suvichar Live\n\nRead | Share | Inspire",
@@ -425,7 +447,8 @@ with tab1:
     url = st.text_input("Enter a news article URL")
     persona = st.selectbox("Choose audience persona:", ["genz", "millenial", "working professionals", "creative thinkers", "spiritual explorers"])
     content_language = st.selectbox("Choose content language", ["English", "Hindi"])
-    number = st.number_input("Enter # of main slides (excluding Headline & Hookline)", min_value=0, max_value=1000, value=10, step=1)
+    number = st.number_input("Enter # of main slides (excluding Headline & Hookline)", min_value=0, max_value=1000, value=6, step=1)
+    st.caption("Total slides = Headline (1) + main slides + Hookline (1). Enforced between 8 and 10 total. CTA is extra.")
 
     if st.button("🚀 Submit and Generate JSON"):
         if url and persona:
@@ -436,8 +459,8 @@ with tab1:
                     result = detect_category_and_subcategory(full_text, content_language)
                     category, subcategory, emotion = result["category"], result["subcategory"], result["emotion"]
 
-                    # clamp slides (we will do: Slide1 (headline) + Slide2..N (connected/points) + Hookline)
-                    N = clamp_slide_count(number)
+                    # clamp main slides based on total min/max
+                    main_count = clamp_main_slides(number)
 
                     # Generate outline
                     outline = title_script_generator(category, subcategory, emotion, full_text, content_language)
@@ -448,8 +471,8 @@ with tab1:
 
                     structured = OrderedDict()
                     structured["storytitle"] = storytitle
-                    # s1..sN
-                    structured.update(restructure_slide_output(outline, N))
+                    # s1..sN (main slides)
+                    structured.update(restructure_slide_output(outline, main_count))
                     structured["hookline"] = hookline
 
                     if content_language == "Hindi":
@@ -595,7 +618,7 @@ with tab4:
                                 break
                     audio_url = data.get("audio_url", "")
                     if para and audio_url:
-                        raw = para.replace("’", "'").replace('"', '&quot;')
+                        raw = str(para).replace("’", "'").replace('"', '&quot;')
                         paragraph = textwrap.shorten(raw, width=180, placeholder="...")
                         all_slides += generate_amp_slide(paragraph, audio_url)
 
@@ -628,7 +651,7 @@ with tab5:
                 r = client.chat.completions.create(
                     model="gpt-5-chat", messages=messages, max_tokens=300, temperature=0.5
                 )
-                out = r.choices[0].message.content
+                out = r.choices[0].message.content or ""
                 desc = re.search(r"[Dd]escription\s*[:\-]\s*(.+)", out)
                 keys = re.search(r"[Kk]eywords\s*[:\-]\s*(.+)", out)
                 tags = re.search(r"[Ff]ilter\s*[Tt]ags\s*[:\-]\s*(.+)", out)
