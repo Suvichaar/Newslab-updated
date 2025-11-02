@@ -7,70 +7,67 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import OrderedDict
 
-import requests, boto3, nltk, zipfile
+import requests, boto3, zipfile
 import streamlit as st
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 from urllib.parse import urlparse
 
+# Optional libs (we keep graceful fallbacks)
+try:
+    import nltk  # not critical; used sometimes for tokenization elsewhere
+except Exception:
+    nltk = None
+
 load_dotenv()
 
-# ── Secrets you must set in .streamlit/secrets.toml ─────────────────────
-# [azure_openai]
-# AZURE_API_KEY = "..."
-# AZURE_ENDPOINT = "https://<your-openai>.cognitiveservices.azure.com"
-# AZURE_DEPLOYMENT = "gpt-5-chat"
-# AZURE_API_VERSION = "2025-01-01-preview"
-#
-# [azure_speech]
-# AZURE_SPEECH_KEY = "..."
-# AZURE_SPEECH_REGION = "eastus"
-# VOICE_NAME = "en-IN-AaravNeural"
-#
-# [azure]
-# # If using your own microservice, point here.
-# # If calling Azure OpenAI Audio TTS directly, use:
-# # "https://<your-openai>.cognitiveservices.azure.com/openai/deployments/<tts-deploy>/audio/speech?api-version=2025-04-01-preview"
-# AZURE_TTS_URL = "https://tts.suvichaar.org/api/speak"
-#
-# [aws]
-# AWS_ACCESS_KEY = "..."
-# AWS_SECRET_KEY = "..."
-# AWS_REGION     = "ap-south-1"
-# AWS_BUCKET     = "suvichaarapp"
-# S3_PREFIX      = "media/"
-# CDN_BASE       = "https://media.suvichaar.org/"
+# ── Secrets structure support ─────────────────────────────────────────────
+# Supports BOTH:
+#   1) nested sections (recommended):
+#      [azure_openai] AZURE_API_KEY=..., etc.
+#      [azure_speech] ...
+#      [azure] AZURE_TTS_URL=...
+#      [aws] AWS_* ...
+#   2) flat keys for compatibility (AZURE_API_KEY=..., AWS_ACCESS_KEY=..., etc.)
+def _get(s: dict, section: str, key: str, default=None):
+    # nested
+    if section in s and isinstance(s[section], dict) and key in s[section]:
+        return s[section][key]
+    # flat fallback
+    return s.get(key, default)
 
 # --- Azure OpenAI (from secrets) ---
-AZURE_API_KEY     = st.secrets["azure_openai"]["AZURE_API_KEY"]
-AZURE_ENDPOINT    = st.secrets["azure_openai"]["AZURE_ENDPOINT"]
-AZURE_DEPLOYMENT  = st.secrets["azure_openai"]["AZURE_DEPLOYMENT"]
-AZURE_API_VERSION = st.secrets["azure_openai"]["AZURE_API_VERSION"]
+AZURE_API_KEY     = _get(st.secrets, "azure_openai", "AZURE_API_KEY")
+AZURE_ENDPOINT    = _get(st.secrets, "azure_openai", "AZURE_ENDPOINT")
+AZURE_DEPLOYMENT  = _get(st.secrets, "azure_openai", "AZURE_DEPLOYMENT", "gpt-5-chat")
+AZURE_API_VERSION = _get(st.secrets, "azure_openai", "AZURE_API_VERSION", "2025-01-01-preview")
 
-# --- Azure Speech (from secrets) ---
-AZURE_SPEECH_KEY    = st.secrets["azure_speech"]["AZURE_SPEECH_KEY"]
-AZURE_SPEECH_REGION = st.secrets["azure_speech"]["AZURE_SPEECH_REGION"]
-DEFAULT_VOICE       = st.secrets["azure_speech"].get("VOICE_NAME", "en-IN-AaravNeural")
+# --- Azure Speech (fallback) ---
+AZURE_SPEECH_KEY    = _get(st.secrets, "azure_speech", "AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = _get(st.secrets, "azure_speech", "AZURE_SPEECH_REGION", "eastus")
+DEFAULT_VOICE       = _get(st.secrets, "azure_speech", "VOICE_NAME", "en-IN-AaravNeural")
 
 # --- Custom TTS microservice or Azure OpenAI Audio TTS URL ---
-AZURE_TTS_URL = st.secrets.get("azure", {}).get(
-    "AZURE_TTS_URL",
-    f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/audio/speech?api-version=2025-04-01-preview"
+# If you set your microservice URL here, it will be used.
+# If left empty, we default to Azure OpenAI Audio TTS endpoint for the SAME deployment name.
+AZURE_TTS_URL = _get(
+    st.secrets, "azure", "AZURE_TTS_URL",
+    f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/audio/speech?api-version=2025-04-01-preview"
 )
 
 # --- AWS (from secrets) ---
-AWS_ACCESS_KEY = st.secrets["aws"]["AWS_ACCESS_KEY"]
-AWS_SECRET_KEY = st.secrets["aws"]["AWS_SECRET_KEY"]
-AWS_REGION     = st.secrets["aws"]["AWS_REGION"]
-AWS_BUCKET     = st.secrets["aws"]["AWS_BUCKET"]
-S3_PREFIX      = st.secrets["aws"].get("S3_PREFIX", "media/")
-CDN_BASE       = st.secrets["aws"]["CDN_BASE"]
+AWS_ACCESS_KEY = _get(st.secrets, "aws", "AWS_ACCESS_KEY")
+AWS_SECRET_KEY = _get(st.secrets, "aws", "AWS_SECRET_KEY")
+AWS_REGION     = _get(st.secrets, "aws", "AWS_REGION", "ap-south-1")
+AWS_BUCKET     = _get(st.secrets, "aws", "AWS_BUCKET", "suvichaarapp")
+S3_PREFIX      = _get(st.secrets, "aws", "S3_PREFIX", "media/")
+CDN_BASE       = _get(st.secrets, "aws", "CDN_BASE", "https://media.suvichaar.org/")
 CDN_PREFIX_MEDIA = "https://media.suvichaar.org/"
 
-# Ensure prefix has trailing slash
 if not S3_PREFIX.endswith("/"):
-    S3_PREFIX = S3_PREFIX + "/"
+    S3_PREFIX += "/"
 
+# --- Boto3 S3 client ---
 s3_client = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -78,7 +75,7 @@ s3_client = boto3.client(
     region_name=AWS_REGION,
 )
 
-# --- Azure OpenAI Client ---
+# --- Azure OpenAI Client for text tasks ---
 client = AzureOpenAI(
     azure_endpoint=AZURE_ENDPOINT,
     api_key=AZURE_API_KEY,
@@ -100,7 +97,6 @@ def _raise_if_bad(resp: requests.Response, context: str):
 # 🔊 Voice selection
 # =========================
 def pick_voice_for_language(lang_code: str, default_voice: str = DEFAULT_VOICE) -> str:
-    """Map detected language → Azure voice name."""
     if not lang_code:
         return default_voice
     l = lang_code.lower()
@@ -139,14 +135,19 @@ def generate_slug_and_urls(title):
     return nano, slug_nano, f"https://suvichaar.org/stories/{slug_nano}", f"https://stories.suvichaar.org/{slug_nano}.html"
 
 def extract_article(url):
-    import newspaper
-    from newspaper import Article
+    try:
+        import newspaper
+        from newspaper import Article
+    except Exception as e:
+        st.warning(f"newspaper3k not installed; returning raw URL as title. Install newspaper3k for better results. ({e})")
+        return url, "No summary available.", "No article content available."
+
     try:
         article = Article(url)
         article.download(); article.parse()
         try:
             article.nlp()
-        except:
+        except Exception:
             pass
         title   = (article.title or "Untitled Article").strip()
         text    = (article.text  or "No article content available.").strip()
@@ -171,7 +172,7 @@ Return ONLY JSON with keys category, subcategory, emotion.
         resp = client.chat.completions.create(
             model=AZURE_DEPLOYMENT,
             messages=[
-                {"role":"system","content":"Classify category, subcategory, and emotion."},
+                {"role":"system","content":"Classify category, subcategory, and emotion. Respond in pure JSON."},
                 {"role":"user","content":prompt.strip()},
             ],
             max_tokens=150
@@ -185,8 +186,12 @@ Return ONLY JSON with keys category, subcategory, emotion.
     return {"category":"Unknown","subcategory":"General","emotion":"Neutral"}
 
 def get_sentiment(text):
-    from textblob import TextBlob
-    if not text or not text.strip(): return "neutral"
+    try:
+        from textblob import TextBlob
+    except Exception:
+        return "neutral"
+    if not text or not text.strip():
+        return "neutral"
     pol = TextBlob(text.strip().replace("\n"," ")).sentiment.polarity
     return "positive" if pol>0.2 else "negative" if pol<-0.2 else "neutral"
 
@@ -197,7 +202,6 @@ MIN_SLIDES = 8
 MAX_SLIDES = 10
 
 def make_connected_point(headline: str, summary: str, lang: str) -> str:
-    """Slide 2 helper: one connected line to the news (no emojis/hashtags)."""
     if (lang or "").lower().startswith("hi"):
         up = f"शीर्षक: {headline}\nसारांश: {summary}\n\nएक वाक्य में, सरल हिंदी में, हेडलाइन से जुड़ा मुख्य बिंदु लिखें (120 वर्णों से कम)।"
     else:
@@ -211,23 +215,25 @@ def make_connected_point(headline: str, summary: str, lang: str) -> str:
             ],
             max_tokens=80, temperature=0.3
         )
-        return r.choices[0].message.content.strip().strip('"')
+        return (r.choices[0].message.content or "").strip().strip('"')
     except Exception:
         return (summary or headline)[:110]
 
 def split_article_into_chunks(article_text: str, desired_count: int, lang: str) -> list:
-    """Simple chunking to fill slides 3..N-1. (Short ≈160 chars)"""
     text = (article_text or "").strip()
     if not text:
         return [""] * max(desired_count, 0)
     paras = [p.strip() for p in text.split("\n") if p.strip()]
     chunks, i = [], 0
-    while len(chunks) < desired_count:
+    while len(chunks) < desired_count and paras:
         part = paras[i % len(paras)]
         if len(part) > 160:
             part = textwrap.shorten(part, width=160, placeholder="…")
         chunks.append(part)
         i += 1
+    if not paras:  # fallback if no newline paras
+        while len(chunks) < desired_count:
+            chunks.append(textwrap.shorten(text, width=160, placeholder="…"))
     return chunks
 
 def build_story_struct(title, summary, article_text, content_language: str, total_slides: int):
@@ -264,10 +270,6 @@ def build_story_struct(title, summary, article_text, content_language: str, tota
     return slides
 
 def restructure_slide_output_for_tts(slides: list) -> OrderedDict:
-    """
-    Flatten slides → {"storytitle":..., "s1paragraph1":..., ..., "hookline": ...}
-    where last slide text is Hookline/CTA.
-    """
     out = OrderedDict()
     if not slides:
         return out
@@ -283,6 +285,7 @@ def restructure_slide_output_for_tts(slides: list) -> OrderedDict:
 # 🔉 Azure Speech fallback (optional)
 # =========================
 def azure_speech_fallback_tts(text: str, voice_name: str) -> bytes:
+    # Standard SSML → Speech service
     ssml = f"<speak version='1.0' xml:lang='en-US'><voice name='{voice_name}'>{text}</voice></speak>"
     url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
     headers = {
@@ -295,8 +298,38 @@ def azure_speech_fallback_tts(text: str, voice_name: str) -> bytes:
     return resp.content
 
 # =========================
-# 🔉 TTS uploader (uses your microservice / Azure OpenAI Audio TTS)
+# 🔉 TTS uploader (Azure OpenAI Audio TTS or custom microservice) + fallback
 # =========================
+def _call_primary_tts(text: str, voice: str) -> bytes:
+    """
+    Primary path:
+      - If AZURE_TTS_URL points to Azure OpenAI Audio TTS:
+          POST .../openai/deployments/<deploy>/audio/speech?api-version=2025-04-01-preview
+          body: {"input":"...", "voice":"alloy|<voice>", "format":"mp3"}
+          headers: api-key + Accept: audio/mpeg
+      - Else: treat as custom microservice: {"model":"tts-1-hd","input":text,"voice":voice}
+    Returns raw audio bytes.
+    """
+    is_azure_audio_tts = ("/openai/deployments/" in AZURE_TTS_URL) and ("/audio/speech" in AZURE_TTS_URL)
+
+    headers = {"Content-Type": "application/json"}
+    payload = {}
+    if is_azure_audio_tts:
+        headers["api-key"] = AZURE_API_KEY
+        headers["Accept"] = "audio/mpeg"
+        payload = {"input": text, "voice": voice, "format": "mp3"}
+    else:
+        # Your microservice contract (adjust if needed)
+        headers["api-key"] = AZURE_API_KEY  # if your microservice expects it; otherwise remove
+        payload = {"model": "tts-1-hd", "input": text, "voice": voice}
+
+    resp = requests.post(AZURE_TTS_URL, headers=headers, json=payload, timeout=90)
+    _raise_if_bad(resp, "TTS call")
+
+    # Azure Audio TTS returns audio bytes in body with audio/mpeg content-type
+    # Microservice may also return bytes directly
+    return resp.content
+
 def synthesize_and_upload(paragraphs: dict, voice_name: str):
     """
     paragraphs structure:
@@ -311,21 +344,7 @@ def synthesize_and_upload(paragraphs: dict, voice_name: str):
     def _speak_and_upload(text: str, voice: str) -> str:
         audio_bytes = None
         try:
-            # Detect Azure Audio TTS endpoint vs custom microservice
-            is_azure_audio_tts = ("/openai/deployments/" in AZURE_TTS_URL) and ("/audio/speech" in AZURE_TTS_URL)
-            payload = (
-                {"input": text, "voice": voice, "format": "mp3"}
-                if is_azure_audio_tts
-                else {"model":"tts-1-hd","input":text, "voice":voice}
-            )
-            resp = requests.post(
-                AZURE_TTS_URL,
-                headers={"Content-Type": "application/json", "api-key": AZURE_API_KEY},
-                json=payload,
-                timeout=60
-            )
-            _raise_if_bad(resp, "TTS call")
-            audio_bytes = resp.content
+            audio_bytes = _call_primary_tts(text, voice)
         except Exception as e:
             st.warning(f"TTS primary call failed, using Azure Speech fallback. Reason: {e}")
             audio_bytes = azure_speech_fallback_tts(text, voice)
@@ -336,7 +355,10 @@ def synthesize_and_upload(paragraphs: dict, voice_name: str):
             f.write(audio_bytes)
         s3_key = f"{S3_PREFIX}{filename}"
         s3_client.upload_file(local_path, AWS_BUCKET, s3_key)
-        os.remove(local_path)
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
         return f"{CDN_BASE}{s3_key}"
 
     # Slide 1: storytitle (emit audio_url1)
@@ -447,7 +469,7 @@ def replace_placeholders_in_html(html_text, json_data):
     storytitle = s1.get("storytitle", "")
     storytitle_url = s1.get("audio_url1", s1.get("audio_url",""))
 
-    # Hookline: prefer explicit 'hookline' if present on any slide; else fallback to last slide's paragraph
+    # Hookline: prefer explicit 'hookline' if present; else fallback to last slide's paragraph
     hookline = ""
     hookline_url = ""
     slide_nums = sorted([int(k.replace("slide","")) for k in json_data.keys() if k.startswith("slide")])
@@ -492,8 +514,8 @@ with tab1:
             with st.spinner("Analyzing the article and generating slides..."):
                 try:
                     title, summary, full_text = extract_article(url)
-                    _ = get_sentiment(summary or full_text)  # available if you need it
-                    _ = detect_category_and_subcategory(full_text, content_language)  # not displayed here
+                    _ = get_sentiment(summary or full_text)
+                    _ = detect_category_and_subcategory(full_text, content_language)
 
                     slides = build_story_struct(
                         title=title,
@@ -595,7 +617,6 @@ with tab4:
     TEMPLATE_PATH = Path("test.html")
 
     def generate_slide(paragraph: str, audio_url: str):
-        # Neutral default slide image
         return f"""
         <amp-story-page id="page-{uuid.uuid4().hex[:8]}" auto-advance-after="page-audio" class="i-amphtml-layout-container" i-amphtml-layout="container">
             <amp-story-grid-layer template="fill" class="i-amphtml-layout-container" i-amphtml-layout="container">
@@ -953,7 +974,7 @@ with tab6:
                 resp = requests.post(
                     "https://remotion.suvichaar.org/api/generate-news-thumbnail",
                     json=transformed,
-                    timeout=30
+                    timeout=60
                 )
                 _raise_if_bad(resp, "Thumbnail API")
             except requests.RequestException as err:
