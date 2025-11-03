@@ -229,13 +229,15 @@ def title_script_generator(category, subcategory, emotion, article_text, content
     clean_text = re.sub(r'<[^>]+>', '', clean_text)  # Remove HTML tags
     clean_text = clean_text.strip()[:3000]
     
-    system_prompt = f"""You are a concise digital news editor. Create exactly {middle_count} short, engaging slide narrations for a news story.
+    system_prompt = f"""You are a concise digital news editor. Extract and summarize the most important parts of this news article into exactly {middle_count} slide narrations.
 
 Important rules:
-- Each slide should be 1-2 sentences (max 15 words each)
+- Each slide should be a meaningful segment (150-350 characters)
+- Use actual content from the article, NOT generic summaries
 - Write in clear, conversational {content_language}
 - Make each slide informative and engaging
 - No repetition between slides
+- Focus on key facts, numbers, and important details from the article
 
 Return ONLY a valid JSON object with this exact structure:
 {{
@@ -260,7 +262,7 @@ Create exactly {middle_count} slide narrations in JSON format."""
                 {"role": "user", "content": user_prompt.strip()}
             ],
             temperature=0.5,
-            max_tokens=1000
+            max_tokens=2000
         )
         content = response.choices[0].message.content.strip()
         
@@ -329,18 +331,29 @@ def generate_connected_context(title, summary, content_language="English"):
     clean_summary = re.sub(r'<[^>]+>', '', summary) if summary else title
     clean_summary = re.sub(r'\n+', ' ', clean_summary).strip()
     
-    # Get first sentence or title
-    base = clean_summary.split(".")[0] if clean_summary else title
+    # Get meaningful content (first 2-3 sentences, up to 300 chars)
+    sentences = clean_summary.split(".")
+    base = ""
+    for sent in sentences[:3]:
+        if len(base) + len(sent) < 300:
+            base += sent.strip() + ". "
+        else:
+            break
+    
+    # Fallback if still empty
+    if not base.strip():
+        base = clean_summary[:200]
+    
     base = base.strip()
     
-    # Limit length to avoid too long text
-    if len(base) > 100:
-        base = base[:100].rsplit(' ', 1)[0] + "..."
+    # Limit length to 350 characters
+    if len(base) > 350:
+        base = base[:350].rsplit(' ', 1)[0] + "..."
     
     if content_language == "Hindi":
-        return f"जुड़ी जानकारी: {base}."
+        return f"जुड़ी जानकारी: {base}"
     else:
-        return f"Connected context: {base}."
+        return f"Connected context: {base}"
     
 # -------- Hookline (fixed structure for last slide) --------
 def generate_fixed_hookline(hookline_candidate, content_language="English"):
@@ -373,7 +386,7 @@ def generate_remotion_input(tts_output: dict, fixed_image_url: str, author_name:
         slide_index += 1
 
     # Middle slides
-    for i in range(1, 50):
+    for i in range(1, 11):
         key = f"s{i}paragraph1"
         if key in tts_output:
             slide_key = f"slide{slide_index}"
