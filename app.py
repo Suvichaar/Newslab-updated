@@ -224,32 +224,33 @@ def title_script_generator(category, subcategory, emotion, article_text, content
     Slide 1 (headline) and Slide 2 (connected context) are handled outside.
     No persona/Polaris voice is used.
     """
-    system_prompt = f"""
-You are a concise digital news editor.
+    # Clean article text - remove excessive newlines and HTML artifacts
+    clean_text = re.sub(r'\n{3,}', '\n\n', article_text)
+    clean_text = re.sub(r'<[^>]+>', '', clean_text)  # Remove HTML tags
+    clean_text = clean_text.strip()[:3000]
+    
+    system_prompt = f"""You are a concise digital news editor. Create exactly {middle_count} short, engaging slide narrations for a news story.
 
-Create exactly {middle_count} short slide snippets from the article below.
-Language: {content_language}
+Important rules:
+- Each slide should be 1-2 sentences (max 15 words each)
+- Write in clear, conversational {content_language}
+- Make each slide informative and engaging
+- No repetition between slides
 
-Each slide must contain:
-- A short title (max 8 words)
-- A narration hint (what to say, not the actual narration)
-
-Return JSON:
+Return ONLY a valid JSON object with this exact structure:
 {{
   "slides": [
-    {{ "title": "...", "prompt": "..." }},
-    ...
+    {{ "prompt": "First slide narration here" }},
+    {{ "prompt": "Second slide narration here" }}
   ]
-}}
-"""
+}}"""
 
-    user_prompt = f"""
-Category: {category}
-Subcategory: {subcategory}
-Emotion: {emotion}
+    user_prompt = f"""Category: {category} | Subcategory: {subcategory} | Emotion: {emotion}
 
-Article:
-\"\"\"{article_text[:3000]}\"\"\""""
+Article content:
+{clean_text}
+
+Create exactly {middle_count} slide narrations in JSON format."""
 
     try:
         response = client.chat.completions.create(
@@ -258,23 +259,35 @@ Article:
                 {"role": "system", "content": system_prompt.strip()},
                 {"role": "user", "content": user_prompt.strip()}
             ],
-            temperature=0.4
+            temperature=0.5,
+            max_tokens=1000
         )
         content = response.choices[0].message.content.strip()
-        content = content.strip("json").strip("").strip()
+        
+        # Extract JSON from markdown code blocks if present
+        json_match = re.search(r'\{[^}]+\}', content, re.DOTALL)
+        if json_match:
+            content = json_match.group(0)
+        
         payload = json.loads(content)
         slides_raw = payload.get("slides", [])[:middle_count]
+        
+        prepared = []
+        for s in slides_raw:
+            para = s.get("prompt") or s.get("title") or ""
+            if para.strip():
+                prepared.append(para.strip())
+        
+        # Fill remaining with meaningful content
+        while len(prepared) < middle_count:
+            prepared.append("More context on this story.")
+            
     except Exception as e:
-        print("❌ Slide generation failed:", e)
-        slides_raw = []
-
-    prepared = []
-    for s in slides_raw:
-        para = s.get("prompt") or s.get("title") or "Content unavailable"
-        prepared.append(para.strip())
-    while len(prepared) < middle_count:
-        prepared.append("More context on this story.")
-    return prepared
+        print(f"❌ Slide generation failed: {e}")
+        print(f"Content received: {content[:200] if 'content' in locals() else 'None'}")
+        prepared = ["More context on this story."] * middle_count
+        
+    return prepared[:middle_count]
 
 def modify_tab4_json(original_json):
     updated_json = OrderedDict()
@@ -312,11 +325,21 @@ def replace_placeholders_in_html(html_text, json_data):
 
 # -------- Connected context for Slide 2 --------
 def generate_connected_context(title, summary, content_language="English"):
+    # Clean summary - remove HTML tags and excessive whitespace
+    clean_summary = re.sub(r'<[^>]+>', '', summary) if summary else title
+    clean_summary = re.sub(r'\n+', ' ', clean_summary).strip()
+    
+    # Get first sentence or title
+    base = clean_summary.split(".")[0] if clean_summary else title
+    base = base.strip()
+    
+    # Limit length to avoid too long text
+    if len(base) > 100:
+        base = base[:100].rsplit(' ', 1)[0] + "..."
+    
     if content_language == "Hindi":
-        base = (summary.split(".")[0] if summary else title).strip()
         return f"जुड़ी जानकारी: {base}."
     else:
-        base = (summary.split(".")[0] if summary else title).strip()
         return f"Connected context: {base}."
     
 # -------- Hookline (fixed structure for last slide) --------
