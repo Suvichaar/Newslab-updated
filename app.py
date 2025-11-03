@@ -264,22 +264,36 @@ Create exactly {middle_count} slide narrations in JSON format."""
             temperature=0.5,
             max_tokens=2000
         )
-        content = response.choices[0].message.content.strip()
+        raw_content = response.choices[0].message.content.strip()
         
         # Extract JSON from markdown code blocks if present
+        content = raw_content
         if "```json" in content:
-            match = re.search(r'```json\s*(\{.+\})\s*```', content, re.DOTALL)
+            match = re.search(r'```json\s*([\s\S]*?)\s*```', content)
             if match:
-                content = match.group(1)
+                content = match.group(1).strip()
         elif "```" in content:
-            match = re.search(r'```\s*(\{.+\})\s*```', content, re.DOTALL)
+            match = re.search(r'```\s*([\s\S]*?)\s*```', content)
             if match:
-                content = match.group(1)
-        elif not content.startswith("{"):
-            # Try to find JSON object
-            json_match = re.search(r'\{.*"slides".*?\}', content, re.DOTALL)
-            if json_match:
-                content = json_match.group(0)
+                content = match.group(1).strip()
+        
+        # If still not starting with {, try to find JSON object
+        if not content.startswith("{"):
+            # Find first { and last } that balances
+            start_idx = content.find('{')
+            if start_idx != -1:
+                brace_count = 0
+                end_idx = start_idx
+                for i in range(start_idx, len(content)):
+                    if content[i] == '{':
+                        brace_count += 1
+                    elif content[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_idx = i
+                            break
+                if end_idx > start_idx:
+                    content = content[start_idx:end_idx+1]
         
         payload = json.loads(content)
         slides_raw = payload.get("slides", [])[:middle_count]
@@ -295,8 +309,13 @@ Create exactly {middle_count} slide narrations in JSON format."""
             prepared.append("More context on this story.")
             
     except Exception as e:
-        print(f"❌ Slide generation failed: {e}")
-        print(f"Content received: {content[:500] if 'content' in locals() else 'None'}")
+        error_msg = f"❌ Slide generation failed: {e}"
+        print(error_msg)
+        st.error(error_msg)
+        if 'content' in locals():
+            st.code(f"Content received: {content[:1000]}")
+        else:
+            st.warning("No content received from GPT")
         prepared = ["More context on this story."] * middle_count
         
     return prepared[:middle_count]
