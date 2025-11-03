@@ -267,9 +267,19 @@ Create exactly {middle_count} slide narrations in JSON format."""
         content = response.choices[0].message.content.strip()
         
         # Extract JSON from markdown code blocks if present
-        json_match = re.search(r'\{[^}]+\}', content, re.DOTALL)
-        if json_match:
-            content = json_match.group(0)
+        if "```json" in content:
+            match = re.search(r'```json\s*(\{.+\})\s*```', content, re.DOTALL)
+            if match:
+                content = match.group(1)
+        elif "```" in content:
+            match = re.search(r'```\s*(\{.+\})\s*```', content, re.DOTALL)
+            if match:
+                content = match.group(1)
+        elif not content.startswith("{"):
+            # Try to find JSON object
+            json_match = re.search(r'\{.*"slides".*?\}', content, re.DOTALL)
+            if json_match:
+                content = json_match.group(0)
         
         payload = json.loads(content)
         slides_raw = payload.get("slides", [])[:middle_count]
@@ -286,7 +296,7 @@ Create exactly {middle_count} slide narrations in JSON format."""
             
     except Exception as e:
         print(f"❌ Slide generation failed: {e}")
-        print(f"Content received: {content[:200] if 'content' in locals() else 'None'}")
+        print(f"Content received: {content[:500] if 'content' in locals() else 'None'}")
         prepared = ["More context on this story."] * middle_count
         
     return prepared[:middle_count]
