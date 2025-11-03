@@ -63,11 +63,43 @@ s3_client = boto3.client(
 )
 
 # ---- Voice Options (Azure Neural) ----
+def pick_voice_for_language(lang_code: str, default_voice: str) -> str:
+    """Map detected language → Azure voice name."""
+    if not lang_code:
+        return default_voice
+    l = lang_code.lower()
+    if l.startswith("hi"):
+        return "hi-IN-AaravNeural"
+    if l.startswith("en-in"):
+        return "en-IN-NeerjaNeural"
+    if l.startswith("en"):
+        return "en-IN-AaravNeural"
+    if l.startswith("bn"):
+        return "bn-IN-BashkarNeural"
+    if l.startswith("ta"):
+        return "ta-IN-PallaviNeural"
+    if l.startswith("te"):
+        return "te-IN-ShrutiNeural"
+    if l.startswith("mr"):
+        return "mr-IN-AarohiNeural"
+    if l.startswith("gu"):
+        return "gu-IN-DhwaniNeural"
+    if l.startswith("kn"):
+        return "kn-IN-SapnaNeural"
+    if l.startswith("pa"):
+        return "pa-IN-GeetikaNeural"
+    return default_voice
+
 voice_options = {
-    "1": "en-US-BrandonMultilingualNeural",
-    "2": "en-US-JennyNeural",
-    "3": "hi-IN-SwaraNeural",
-    "4": "hi-IN-MadhurNeural"
+    "1": "en-IN-AaravNeural",
+    "2": "hi-IN-AaravNeural",
+    "3": "bn-IN-BashkarNeural",
+    "4": "ta-IN-PallaviNeural",
+    "5": "te-IN-ShrutiNeural",
+    "6": "mr-IN-AarohiNeural",
+    "7": "gu-IN-DhwaniNeural",
+    "8": "kn-IN-SapnaNeural",
+    "9": "pa-IN-GeetikaNeural"
 }
 
 # -------- Slug and URL generator --------
