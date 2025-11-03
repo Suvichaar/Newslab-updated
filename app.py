@@ -354,28 +354,39 @@ def generate_remotion_input(tts_output: dict, fixed_image_url: str, author_name:
 def azure_tts_generate(text: str, voice: str, retries: int = 2, backoff: float = 1.0) -> bytes:
     """
     Generate speech bytes using Azure Speech SDK neural voices.
+    This version works in Streamlit Cloud and other headless servers (no speaker needed).
     """
-    speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
-    speech_config.speech_synthesis_voice_name = voice  # e.g., "en-US-BrandonMultilingualNeural"
-    # Default output to memory (no file)
-    audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=False)
+    speech_config = speechsdk.SpeechConfig(
+        subscription=AZURE_SPEECH_KEY,
+        region=AZURE_SPEECH_REGION
+    )
+    speech_config.speech_synthesis_voice_name = voice
+    speech_config.set_speech_synthesis_output_format(
+        speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3
+    )
+
+    # ✅ Output to memory — safe for Streamlit Cloud
+    audio_config = None
 
     for attempt in range(retries + 1):
-        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+        synthesizer = speechsdk.SpeechSynthesizer(
+            speech_config=speech_config,
+            audio_config=audio_config
+        )
         result = synthesizer.speak_text_async(text).get()
 
         if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-            return result.audio_data
+            return result.audio_data  # Return bytes directly
 
-        # Retriable?
         if result.reason == speechsdk.ResultReason.Canceled and attempt < retries:
             time.sleep(backoff * (2 ** attempt))
             continue
 
-        # Last attempt failed: raise with details
         if result.reason == speechsdk.ResultReason.Canceled:
             details = result.cancellation_details
-            raise RuntimeError(f"Azure TTS canceled: {details.reason}; error={getattr(details,'error_details',None)}")
+            raise RuntimeError(
+                f"Azure TTS canceled: {details.reason}; error={getattr(details, 'error_details', None)}"
+            )
         else:
             raise RuntimeError(f"Azure TTS failed with reason: {result.reason}")
 
