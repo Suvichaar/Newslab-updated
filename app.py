@@ -354,11 +354,11 @@ def generate_remotion_input(tts_output: dict, fixed_image_url: str, author_name:
 def azure_tts_generate(text: str, voice: str, retries: int = 2, backoff: float = 1.0) -> bytes:
     """
     Generate speech bytes using Azure Speech SDK neural voices.
-    This version works in Streamlit Cloud and other headless servers (no speaker needed).
+    Works for Cognitive Services endpoint (not region-specific Speech resource).
     """
     speech_config = speechsdk.SpeechConfig(
-        subscription=AZURE_SPEECH_KEY,
-        region=AZURE_SPEECH_REGION
+        endpoint="https://suvichaarai008818057333687.cognitiveservices.azure.com/",
+        subscription=AZURE_SPEECH_KEY
     )
     speech_config.speech_synthesis_voice_name = voice
     speech_config.set_speech_synthesis_output_format(
@@ -391,6 +391,7 @@ def azure_tts_generate(text: str, voice: str, retries: int = 2, backoff: float =
             raise RuntimeError(f"Azure TTS failed with reason: {result.reason}")
 
     raise RuntimeError("Azure TTS failed after retries")
+
 
 def synthesize_and_upload(paragraphs, voice):
     s3 = boto3.client(
