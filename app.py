@@ -40,16 +40,29 @@ DEFAULT_CTA_AUDIO = "https://cdn.suvichaar.org/media/tts_cta_default.mp3"
 MIN_TOTAL_SLIDES = 8
 MAX_TOTAL_SLIDES = 10
 
-# ---------- Secrets ----------
+# ---------- OpenAI (Chat completions) ----------
 client = AzureOpenAI(
     azure_endpoint=st.secrets["azure_api"]["AZURE_OPENAI_ENDPOINT"],
     api_key=st.secrets["azure_api"]["AZURE_OPENAI_API_KEY"],
-    api_version="2025-01-01-preview",
+    api_version=st.secrets["azure_api"].get("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
 )
 
-AZURE_TTS_URL = st.secrets["azure"]["AZURE_TTS_URL"]
+# ---------- TTS CONFIG (choose provider via secrets) ----------
+# TTS_PROVIDER: "openai" for Azure OpenAI TTS, "speech" for Azure Speech (Cognitive Services)
+TTS_PROVIDER = st.secrets["azure"].get("TTS_PROVIDER", "openai").lower()
+
+# Common (both modes use a key in [azure].AZURE_API_KEY)
 AZURE_API_KEY = st.secrets["azure"]["AZURE_API_KEY"]
 
+# If TTS_PROVIDER == "openai":
+AZURE_OPENAI_ENDPOINT = st.secrets["azure_api"]["AZURE_OPENAI_ENDPOINT"].rstrip("/")
+AZURE_OPENAI_API_VERSION = st.secrets["azure_api"].get("AZURE_OPENAI_API_VERSION", "2024-09-01-preview")
+AZURE_TTS_DEPLOYMENT = st.secrets["azure"].get("AZURE_TTS_DEPLOYMENT", "gpt-4o-mini-tts")  # your deployment name
+
+# If TTS_PROVIDER == "speech":
+AZURE_SPEECH_REGION = st.secrets["azure"].get("AZURE_SPEECH_REGION", "")  # e.g., "eastus"
+
+# ---------- AWS / S3 ----------
 AWS_ACCESS_KEY = st.secrets["aws"]["AWS_ACCESS_KEY"]
 AWS_SECRET_KEY = st.secrets["aws"]["AWS_SECRET_KEY"]
 AWS_REGION     = st.secrets["aws"]["AWS_REGION"]
@@ -65,14 +78,27 @@ s3_client = boto3.client(
     region_name=AWS_REGION,
 )
 
-voice_options = {
-    "1": "alloy",
-    "2": "echo",
-    "3": "fable",
-    "4": "onyx",
-    "5": "nova",
-    "6": "shimmer",
-}
+# Voice options depend on provider
+if TTS_PROVIDER == "speech":
+    # Azure Speech neural voice names (examples)
+    voice_options = {
+        "1": "en-US-JennyNeural",
+        "2": "en-US-GuyNeural",
+        "3": "hi-IN-SwaraNeural",
+        "4": "hi-IN-MadhurNeural",
+        "5": "en-GB-RyanNeural",
+        "6": "en-GB-SoniaNeural",
+    }
+else:
+    # Azure OpenAI TTS (model-supported short names)
+    voice_options = {
+        "1": "alloy",
+        "2": "echo",
+        "3": "fable",
+        "4": "onyx",
+        "5": "nova",
+        "6": "shimmer",
+    }
 
 def clamp_main_slides(requested_main: int) -> int:
     """
@@ -220,7 +246,8 @@ Emotion: {emotion}
 Article:
 \"\"\"{article_text[:3000]}\"\"\""""
 
-    resp = client.chat.completions.create(
+    resp = client.chat_completions.create if hasattr(client, "chat_completions") else client.chat.completions.create
+    r = resp(
         model="gpt-5-chat",
         messages=[
             {"role": "system", "content": sys.strip()},
@@ -228,7 +255,7 @@ Article:
         ],
         temperature=0.5,
     )
-    raw = resp.choices[0].message.content.strip()
+    raw = r.choices[0].message.content.strip()
     raw = raw.strip("```json").strip("```").strip()
 
     try:
@@ -336,14 +363,57 @@ def generate_storytitle(title, summary, content_language="English"):
 # TTS + Upload (order: title -> s1..sN -> hookline -> CTA)
 # =========================
 def _tts_bytes(text: str, voice: str) -> bytes:
-    r = requests.post(
-        AZURE_TTS_URL,
-        headers={"Content-Type": "application/json", "api-key": AZURE_API_KEY},
-        json={"model": "tts-1-hd", "input": text, "voice": voice},
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.content
+    """
+    Two providers:
+      - Azure OpenAI TTS (deployment-based): /openai/deployments/{deployment}/audio/speech
+      - Azure Speech Service (SSML): https://{region}.tts.speech.microsoft.com/cognitiveservices/v1
+    """
+    if TTS_PROVIDER == "openai":
+        # Azure OpenAI Audio (Text-to-Speech): ensure deployment exists & key/endpoint match the same resource
+        url = (
+            f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/"
+            f"{AZURE_TTS_DEPLOYMENT}/audio/speech?api-version={AZURE_OPENAI_API_VERSION}"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": AZURE_API_KEY,
+        }
+        payload = {
+            "input": text,
+            "voice": voice,   # e.g., "alloy", "nova" (must be supported by the deployment)
+            "format": "mp3",
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        if r.status_code == 401:
+            raise RuntimeError(f"Azure OpenAI TTS 401 — check key, endpoint & deployment: {r.text}")
+        r.raise_for_status()
+        return r.content
+
+    elif TTS_PROVIDER == "speech":
+        # Azure Speech (Cognitive Services) — Neural voice names required, e.g., en-US-JennyNeural
+        if not AZURE_SPEECH_REGION:
+            raise RuntimeError("AZURE_SPEECH_REGION missing for Speech TTS")
+        url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
+        headers = {
+            "Ocp-Apim-Subscription-Key": AZURE_API_KEY,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "audio-16khz-128kbitrate-mono-mp3",
+        }
+        ssml = f"""
+<speak version="1.0" xml:lang="en-US">
+  <voice name="{voice}">
+    {text}
+  </voice>
+</speak>
+        """.strip()
+        r = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60)
+        if r.status_code == 401:
+            raise RuntimeError(f"Azure Speech 401 — check region & key: {r.text}")
+        r.raise_for_status()
+        return r.content
+
+    else:
+        raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER}")
 
 def _upload_bytes_to_s3(data: bytes, ext: str = ".mp3") -> str:
     filename = f"tts_{uuid.uuid4().hex}{ext}"
@@ -496,8 +566,9 @@ with tab1:
 # -------------------- Tab 2 --------------------
 with tab2:
     st.subheader("🎙️ Text-to-Speech → S3")
-    uploaded_file = st.file_uploader("Upload structured slide JSON", type=["json"])
+    st.caption(f"TTS provider: **{TTS_PROVIDER}**")
     voice_label = st.selectbox("Choose Voice", list(voice_options.values()))
+    uploaded_file = st.file_uploader("Upload structured slide JSON", type=["json"])
 
     if uploaded_file and voice_label:
         paragraphs = json.load(uploaded_file)
@@ -505,7 +576,11 @@ with tab2:
 
         if st.button("🚀 Generate TTS + Upload to S3"):
             with st.spinner("Synthesizing & uploading..."):
-                output = synthesize_and_upload(paragraphs, voice_label, add_cta=True)
+                try:
+                    output = synthesize_and_upload(paragraphs, voice_label, add_cta=True)
+                except Exception as e:
+                    st.error(f"TTS error: {e}")
+                    st.stop()
                 st.success("✅ Uploaded to S3")
 
                 ts = int(time.time())
@@ -729,10 +804,6 @@ with tab5:
 
             # Build responsive variants via CloudFront lambda@edge encoding
             parsed_path = key_path
-            resize_presets = {
-                "potraitcoverurl": (640, 853),
-                "msthumbnailcoverurl": (300, 300),
-            }
             def encode_resize(w,h):
                 template = {"bucket": AWS_BUCKET, "key": parsed_path, "edits":{"resize":{"width":w,"height":h,"fit":"cover"}}}
                 return f"{CDN_PREFIX_MEDIA}{base64.urlsafe_b64encode(json.dumps(template).encode()).decode()}"
@@ -772,7 +843,7 @@ with tab5:
                     "story_link": canurl,
                     "storyhtmlurl": canurl1,
                     "urlslug": slug_nano,
-                    "cover_image_link": cover_image_url or uploaded_url,
+                    "cover_image_link": (cover_image_url or uploaded_url),
                     "publisher_id": 1,
                     "story_logo_link": "https://media.suvichaar.org/filters:resize/96x96/media/brandasset/suvichaariconblack.png",
                     "keywords": meta_keywords,
