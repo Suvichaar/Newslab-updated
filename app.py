@@ -44,7 +44,7 @@ client = AzureOpenAI(
 
 # ---- Azure Speech (Neural TTS) ----
 AZURE_SPEECH_KEY   = st.secrets["azure"]["AZURE_API_KEY"]
-AZURE_SPEECH_REGION = st.secrets["azure"].get("AZURE_REGION", "centralindia")  # ensure region matches your resource
+AZURE_SPEECH_REGION = st.secrets["azure"].get("AZURE_REGION", "eastus")  # ensure region matches your resource
 
 # ---- AWS ----
 AWS_ACCESS_KEY = st.secrets["aws"]["AWS_ACCESS_KEY"]
@@ -354,11 +354,11 @@ def generate_remotion_input(tts_output: dict, fixed_image_url: str, author_name:
 def azure_tts_generate(text: str, voice: str, retries: int = 2, backoff: float = 1.0) -> bytes:
     """
     Generate speech bytes using Azure Speech SDK neural voices.
-    Works for Cognitive Services endpoint (not region-specific Speech resource).
+    Uses region-based configuration instead of endpoint.
     """
     speech_config = speechsdk.SpeechConfig(
-        endpoint="https://suvichaarai008818057333687.cognitiveservices.azure.com/",
-        subscription=AZURE_SPEECH_KEY
+        subscription=AZURE_SPEECH_KEY,
+        region=AZURE_SPEECH_REGION
     )
     speech_config.speech_synthesis_voice_name = voice
     speech_config.set_speech_synthesis_output_format(
