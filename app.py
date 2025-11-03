@@ -1,24 +1,25 @@
-import os
-import re
-import io
 import json
 import time
+import os
 import uuid
-import base64
-import zipfile
-import random
-import string
-import textwrap
 import requests
 import boto3
 import nltk
-from urllib.parse import urlparse
-from pathlib import Path
-from collections import OrderedDict
-from datetime import datetime, timezone
+import datetime
 from dotenv import load_dotenv
-import streamlit as st
 from openai import AzureOpenAI
+from pathlib import Path
+import streamlit as st
+from collections import OrderedDict
+import zipfile
+import io
+from datetime import datetime
+import random, string, base64
+from urllib.parse import urlparse
+from io import BytesIO
+import re
+from datetime import datetime, timezone
+import textwrap
 
 # =========================
 # Base Config & Utilities
@@ -31,101 +32,64 @@ try:
 except LookupError:
     nltk.download('punkt')
 
-# ---------- Constants (edit to your CDN paths) ----------
+# ---------- Constants ----------
 DEFAULT_COVER_URL = "https://media.suvichaar.org/upload/covers/default_news.png"
 DEFAULT_SLIDE_IMAGE_URL = "https://media.suvichaar.org/upload/covers/default_news_slide.png"
 DEFAULT_CTA_AUDIO = "https://cdn.suvichaar.org/media/tts_cta_default.mp3"
 
-# Enforce total slides (Headline + main slides + Hookline). CTA is extra.
+# Enforce total slides (Headline + middle slides + Hookline). CTA text is included on Hookline slide.
 MIN_TOTAL_SLIDES = 8
 MAX_TOTAL_SLIDES = 10
 
-# ---------- OpenAI (Chat completions) ----------
+# ---- Azure OpenAI Client ----
 client = AzureOpenAI(
-    azure_endpoint=st.secrets["azure_api"]["AZURE_OPENAI_ENDPOINT"],
-    api_key=st.secrets["azure_api"]["AZURE_OPENAI_API_KEY"],
-    api_version=st.secrets["azure_api"].get("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
+    azure_endpoint= st.secrets["azure_api"]["AZURE_OPENAI_ENDPOINT"],
+    api_key= st.secrets["azure_api"]["AZURE_OPENAI_API_KEY"],
+    api_version="2025-01-01-preview"
 )
 
-# ---------- TTS CONFIG (choose provider via secrets) ----------
-# TTS_PROVIDER: "openai" for Azure OpenAI TTS, "speech" for Azure Speech (Cognitive Services)
-TTS_PROVIDER = st.secrets["azure"].get("TTS_PROVIDER", "openai").lower()
-
-# Common (both modes use a key in [azure].AZURE_API_KEY)
+# ---- Azure TTS (proxy) ----
+AZURE_TTS_URL = st.secrets["azure"]["AZURE_TTS_URL"]
 AZURE_API_KEY = st.secrets["azure"]["AZURE_API_KEY"]
 
-# If TTS_PROVIDER == "openai":
-AZURE_OPENAI_ENDPOINT = st.secrets["azure_api"]["AZURE_OPENAI_ENDPOINT"].rstrip("/")
-AZURE_OPENAI_API_VERSION = st.secrets["azure_api"].get("AZURE_OPENAI_API_VERSION", "2024-09-01-preview")
-AZURE_TTS_DEPLOYMENT = st.secrets["azure"].get("AZURE_TTS_DEPLOYMENT", "gpt-4o-mini-tts")  # your deployment name
-
-# If TTS_PROVIDER == "speech":
-AZURE_SPEECH_REGION = st.secrets["azure"].get("AZURE_SPEECH_REGION", "")  # e.g., "eastus"
-
-# ---------- AWS / S3 ----------
+# ---- AWS ----
 AWS_ACCESS_KEY = st.secrets["aws"]["AWS_ACCESS_KEY"]
 AWS_SECRET_KEY = st.secrets["aws"]["AWS_SECRET_KEY"]
-AWS_REGION     = st.secrets["aws"]["AWS_REGION"]
-AWS_BUCKET     = st.secrets["aws"]["AWS_BUCKET"]
-S3_PREFIX      = "media/"
-CDN_BASE       = st.secrets["aws"]["CDN_BASE"]
+AWS_REGION = st.secrets["aws"]["AWS_REGION"]
+AWS_BUCKET = st.secrets["aws"]["AWS_BUCKET"]
+S3_PREFIX = "media/"
+CDN_BASE = st.secrets["aws"]["CDN_BASE"]
 CDN_PREFIX_MEDIA = "https://media.suvichaar.org/"
 
 s3_client = boto3.client(
     "s3",
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=AWS_REGION,
+    aws_access_key_id     = AWS_ACCESS_KEY,
+    aws_secret_access_key = AWS_SECRET_KEY,
+    region_name           = AWS_REGION,
 )
 
-# Voice options depend on provider
-if TTS_PROVIDER == "speech":
-    # Azure Speech neural voice names (examples)
-    voice_options = {
-        "1": "en-US-JennyNeural",
-        "2": "en-US-GuyNeural",
-        "3": "hi-IN-SwaraNeural",
-        "4": "hi-IN-MadhurNeural",
-        "5": "en-GB-RyanNeural",
-        "6": "en-GB-SoniaNeural",
-    }
-else:
-    # Azure OpenAI TTS (model-supported short names)
-    voice_options = {
-        "1": "alloy",
-        "2": "echo",
-        "3": "fable",
-        "4": "onyx",
-        "5": "nova",
-        "6": "shimmer",
-    }
+voice_options = {
+    "1": "alloy",
+    "2": "echo",
+    "3": "fable",
+    "4": "onyx",
+    "5": "nova",
+    "6": "shimmer"
+}
 
-def clamp_main_slides(requested_main: int) -> int:
-    """
-    requested_main = slides between Headline and Hookline.
-    We clamp TOTAL slides (Headline + main + Hookline) into [8..10].
-    CTA is not counted in this min/max.
-    """
-    total = 2 + int(requested_main)  # +Headline +Hookline
-    total = max(MIN_TOTAL_SLIDES, min(MAX_TOTAL_SLIDES, total))
-    return max(0, total - 2)
-
-def generate_slug_and_urls(title: str):
+# -------- Slug and URL generator --------
+def generate_slug_and_urls(title):
     if not title or not isinstance(title, str):
         raise ValueError("Invalid title")
-    slug = ''.join(
-        c for c in title.lower().replace(" ", "-").replace("_", "-")
-        if c in string.ascii_lowercase + string.digits + '-'
-    ).strip('-')
+    safe = ''.join(c for c in title.lower().replace(" ", "-").replace("_", "-")
+                   if c in string.ascii_lowercase + string.digits + '-')
+    slug = safe.strip('-') or "story"
     nano = ''.join(random.choices(string.ascii_letters + string.digits + '_-', k=10)) + '_G'
-    slug_nano = f"{slug}_{nano}"
+    slug_nano = f"{slug}_{nano}"  # -> slug_nano.html
     return nano, slug_nano, f"https://suvichaar.org/stories/{slug_nano}", f"https://stories.suvichaar.org/{slug_nano}.html"
 
-# =========================
-# Extract / Analyze
-# =========================
+# === Utility Functions ===
 def extract_article(url):
-    # lazy import to avoid installing when not needed
     import newspaper
     from newspaper import Article
     try:
@@ -134,42 +98,28 @@ def extract_article(url):
         article.parse()
         try:
             article.nlp()
-        except Exception:
+        except:
             pass
         title = (article.title or "Untitled Article").strip()
         text = (article.text or "No article content available.").strip()
         summary = (article.summary or text[:300]).strip()
         return title, summary, text
     except Exception as e:
-        st.error(f"❌ Failed to extract article: {e}")
+        st.error(f"❌ Failed to extract article from URL. Error: {str(e)}")
         return "Untitled Article", "No summary available.", "No article content available."
 
-def get_sentiment(text: str) -> str:
-    """
-    Dependency-free lightweight heuristic sentiment.
-    Returns: 'positive' | 'negative' | 'neutral'
-    """
-    if not text or not str(text).strip():
+def get_sentiment(text):
+    from textblob import TextBlob
+    if not text or not text.strip():
         return "neutral"
-    t = str(text).lower()
-
-    pos_words = {
-        "growth","improved","record","gain","surge","soar","win","wins","victory","milestone",
-        "boost","increase","expansion","positive","rise","strong","beat","beats","achieve","achieved"
-    }
-    neg_words = {
-        "decline","drop","fall","fell","loss","losses","downturn","crash","fail","failed","failure",
-        "delay","delayed","negative","fraud","scam","ban","banned","risk","risks","cut","cuts","layoff",
-        "layoffs","debt","default","crisis","crises","probe","investigation"
-    }
-
-    pos = sum(w in t for w in pos_words)
-    neg = sum(w in t for w in neg_words)
-    if pos - neg > 1:
+    clean_text = text.strip().replace("\n", " ")
+    polarity = TextBlob(clean_text).sentiment.polarity
+    if polarity > 0.2:
         return "positive"
-    if neg - pos > 1:
+    elif polarity < -0.2:
         return "negative"
-    return "neutral"
+    else:
+        return "neutral"
 
 def detect_category_and_subcategory(text, content_language="English"):
     if not text or len(text.strip()) < 50:
@@ -178,67 +128,89 @@ def detect_category_and_subcategory(text, content_language="English"):
     if content_language == "Hindi":
         prompt = f"""
 आप एक समाचार विश्लेषण विशेषज्ञ हैं।
-इस लेख का विश्लेषण करके JSON दें:
+इस समाचार लेख का विश्लेषण करें और नीचे तीन बातें बताएं:
 
-{{
-  "category": "...",
-  "subcategory": "...",
-  "emotion": "..."
-}}
+1. category (श्रेणी)
+2. subcategory (उपश्रेणी)
+3. emotion (भावना)
 
 लेख:
-\"\"\"{text[:3000]}\"\"\""""
-    else:
-        prompt = f"""
-You are a news analysis expert. Return JSON only:
+\"\"\"{text[:3000]}\"\"\"
 
+
+जवाब केवल JSON में दें:
 {{
   "category": "...",
   "subcategory": "...",
   "emotion": "..."
 }}
+"""
+    else:
+        prompt = f"""
+You are an expert news analyst.
+Analyze the following news article and return:
+
+1. category
+2. subcategory
+3. emotion
 
 Article:
-\"\"\"{text[:3000]}\"\"\""""
+\"\"\"{text[:3000]}\"\"\"
 
+
+Return ONLY as JSON:
+{{
+  "category": "...",
+  "subcategory": "...",
+  "emotion": "..."
+}}
+"""
     try:
-        resp = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-5-chat",
             messages=[
-                {"role": "system", "content": "Classify the news article."},
-                {"role": "user", "content": prompt.strip()},
+                {"role": "system", "content": "Classify the news into category, subcategory, and emotion."},
+                {"role": "user", "content": prompt.strip()}
             ],
-            max_tokens=150,
+            max_tokens=150
         )
-        content = resp.choices[0].message.content.strip()
+        content = response.choices[0].message.content.strip()
         content = content.strip("```json").strip("```").strip()
-        data = json.loads(content)
-        if all(k in data for k in ("category", "subcategory", "emotion")):
-            return data
-    except Exception:
-        pass
+        result = json.loads(content)
+        if all(k in result for k in ["category", "subcategory", "emotion"]):
+            return result
+    except Exception as e:
+        print("❌ Category detection failed:", e)
+
     return {"category": "Unknown", "subcategory": "General", "emotion": "Neutral"}
 
-# =========================
-# Slide Generator (No Polaris)
-# =========================
-def title_script_generator(category, subcategory, emotion, article_text, content_language="English"):
-    """Enforces:
-    - Slide 1 = Headline
-    - Slide 2 = connected 'what/why' context
-    - Remaining slides = concise points
-    (Narrations created later)
+# -------- Slide content generator (no Polaris) --------
+def title_script_generator(category, subcategory, emotion, article_text, content_language="English", middle_count=5):
     """
-    sys = f"""
-You are a digital editor.
-Create a structured web story outline in {content_language}:
-- Slide 1: the news headline (short)
-- Slide 2: a connected one-liner (what/why context)
-- Slides 3..N: concise points derived from the article
-Return JSON only with:
-{{ "slides": [{{"title":"..." , "prompt":"instruction to narrate"}}, ...] }}
+    Generates middle_count slides (for slides 3..N-1).
+    Slide 1 (headline) and Slide 2 (connected context) are handled outside.
+    No persona/Polaris voice is used.
+    """
+    system_prompt = f"""
+You are a concise digital news editor.
+
+Create exactly {middle_count} short slide snippets from the article below.
+Language: {content_language}
+
+Each slide must contain:
+- A short title (max 8 words)
+- A narration hint (what to say, not the actual narration)
+
+Return JSON:
+{{
+  "slides": [
+    {{ "title": "...", "prompt": "..." }},
+    ...
+  ]
+}}
 """
-    usr = f"""
+
+    user_prompt = f"""
 Category: {category}
 Subcategory: {subcategory}
 Emotion: {emotion}
@@ -246,423 +218,472 @@ Emotion: {emotion}
 Article:
 \"\"\"{article_text[:3000]}\"\"\""""
 
-    resp = client.chat_completions.create if hasattr(client, "chat_completions") else client.chat.completions.create
-    r = resp(
-        model="gpt-5-chat",
-        messages=[
-            {"role": "system", "content": sys.strip()},
-            {"role": "user", "content": usr.strip()},
-        ],
-        temperature=0.5,
-    )
-    raw = r.choices[0].message.content.strip()
-    raw = raw.strip("```json").strip("```").strip()
-
     try:
-        slides = json.loads(raw)["slides"]
-    except Exception:
-        slides = []
+        response = client.chat.completions.create(
+            model="gpt-5-chat",
+            messages=[
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": user_prompt.strip()}
+            ],
+            temperature=0.4
+        )
+        content = response.choices[0].message.content.strip()
+        content = content.strip("```json").strip("```").strip()
+        payload = json.loads(content)
+        slides_raw = payload.get("slides", [])[:middle_count]
+    except Exception as e:
+        print("❌ Slide generation failed:", e)
+        slides_raw = []
 
-    return {"category": category, "subcategory": subcategory, "emotion": emotion, "slides": slides}
+    # Convert to simple list of strings (we only need final displayed paragraphs later).
+    # We'll use the 'prompt' or fallback to 'title'.
+    prepared = []
+    for s in slides_raw:
+        para = s.get("prompt") or s.get("title") or "Content unavailable"
+        prepared.append(para.strip())
+    # Pad if fewer than requested
+    while len(prepared) < middle_count:
+        prepared.append("More context on this story.")
+    return prepared
 
-def restructure_slide_output(final_output, main_slide_count):
-    """Return dict with s1..sNparagraph1 placeholders (content only).
-    We'll generate narrations per slide later."""
-    slides = final_output.get("slides", [])[:main_slide_count]  # clamp early
-    structured = OrderedDict()
-    for idx, slide in enumerate(slides, start=1):
-        key = f"s{idx}paragraph1"
-        # Prefer the slide title as the visible line; narration will be separate audio
-        text = (slide.get("title") or slide.get("prompt") or "").strip()
-        structured[key] = text or f"Slide {idx}"
+def modify_tab4_json(original_json):
+    updated_json = OrderedDict()
+    slide_number = 2  # Start from slide2 since slide1 & slide2 are removed
+    for i in range(3, 100):  # Covers slide3 to slide99
+        old_key = f"slide{i}"
+        if old_key not in original_json:
+            break
+        content = original_json[old_key]
+        new_key = f"slide{slide_number}"
+        for k, v in content.items():
+            if k.endswith("paragraph1"):
+                para_key = f"s{slide_number}paragraph1"
+                audio_key = f"audio_url{slide_number}"
+                updated_json[new_key] = {
+                    para_key: v,
+                    audio_key: content.get("audio_url", ""),
+                    "voice": content.get("voice", "")
+                }
+                break
+        slide_number += 1
+    return updated_json
+
+def replace_placeholders_in_html(html_text, json_data):
+    storytitle = json_data.get("slide1", {}).get("storytitle", "")
+    storytitle_url = json_data.get("slide1", {}).get("audio_url", "")
+    hookline = json_data.get("slide2", {}).get("hookline", "")
+    hookline_url = json_data.get("slide2", {}).get("audio_url", "")
+
+    html_text = html_text.replace("{{storytitle}}", storytitle)
+    html_text = html_text.replace("{{storytitle_audiourl}}", storytitle_url)
+    html_text = html_text.replace("{{hookline}}", hookline)
+    html_text = html_text.replace("{{hookline_audiourl}}", hookline_url)
+    return html_text
+
+# -------- Connected context for Slide 2 --------
+def generate_connected_context(title, summary, content_language="English"):
+    # Keep it deterministic and short without personas.
+    if content_language == "Hindi":
+        # Use summary's first sentence if available
+        base = (summary.split(".")[0] if summary else title).strip()
+        return f"जुड़ी जानकारी: {base}."
+    else:
+        base = (summary.split(".")[0] if summary else title).strip()
+        return f"Connected context: {base}."
+    
+# -------- Hookline (fixed structure for last slide) --------
+def generate_fixed_hookline(hookline_candidate, content_language="English"):
+    """
+    Last slide text includes the supplied hookline plus fixed footer lines.
+    """
+    footer = "For Such Content Stay Connected with Suvichar Live\n\nRead | Share | Inspire"
+    if not hookline_candidate:
+        hookline_candidate = "Stay informed with the latest updates."
+    if content_language == "Hindi":
+        # Keep provided hookline as-is (caller may supply Hindi), then add English footer per requirement.
+        return f"{hookline_candidate}\n\n{footer}"
+    else:
+        return f"{hookline_candidate}\n\n{footer}"
+
+def restructure_slide_output_for_middle(middle_slides):
+    """
+    Turn list[str] -> dict like {"s1paragraph1": "...", ...}
+    These will map to slides 3..N-1 later.
+    """
+    structured = {}
+    for idx, text in enumerate(middle_slides, start=1):
+        structured[f"s{idx}paragraph1"] = text.strip() if text else "Content unavailable"
     return structured
 
-# =========================
-# Language helpers (optional Hindi)
-# =========================
+def generate_remotion_input(tts_output: dict, fixed_image_url: str, author_name: str = "Suvichaar"):
+    remotion_data = OrderedDict()
+    slide_index = 1
+
+    # Slide 1: storytitle
+    if "storytitle" in tts_output:
+        remotion_data[f"slide{slide_index}"] = {
+            f"s{slide_index}paragraph1": tts_output["storytitle"],
+            f"s{slide_index}audio1": tts_output.get(f"slide{slide_index}", {}).get("audio_url", ""),
+            f"s{slide_index}image1": fixed_image_url,
+            f"s{slide_index}paragraph2": f"- {author_name}"
+        }
+        slide_index += 1
+
+    # Slides for s1paragraph1.. -> sequential
+    # The TTS output stores these as slide3.. etc; we will simply copy order after storytitle & hookline.
+    for i in range(1, 50):
+        key = f"s{i}paragraph1"
+        if key in tts_output:
+            slide_key = f"slide{slide_index}"
+            remotion_data[slide_key] = {
+                f"s{slide_index}paragraph1": tts_output[key],
+                f"s{slide_index}audio1": tts_output.get(slide_key, {}).get("audio_url", ""),
+                f"s{slide_index}image1": fixed_image_url,
+                f"s{slide_index}paragraph2": f"- {author_name}"
+            }
+            slide_index += 1
+        else:
+            break
+
+    # Hookline slide (stored as 'hookline' text in tts_output)
+    if "hookline" in tts_output:
+        slide_key = f"slide{slide_index}"
+        remotion_data[slide_key] = {
+            f"s{slide_index}paragraph1": tts_output["hookline"],
+            f"s{slide_index}audio1": tts_output.get(slide_key, {}).get("audio_url", ""),
+            f"s{slide_index}image1": fixed_image_url,
+            f"s{slide_index}paragraph2": f"- {author_name}"
+        }
+        slide_index += 1
+
+    # No extra CTA slide—footer text is already in hookline slide
+    # Save to file
+    timestamp = int(time.time())
+    filename = f"remotion_input_{timestamp}.json"
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(remotion_data, f, indent=2, ensure_ascii=False)
+    return filename
+
+def synthesize_and_upload(paragraphs, voice):
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        region_name=AWS_REGION,
+    )
+    result = OrderedDict()
+    os.makedirs("temp", exist_ok=True)
+
+    slide_index = 1
+
+    # Slide 1: storytitle (headline)
+    if "storytitle" in paragraphs:
+        storytitle = paragraphs["storytitle"]
+        response = requests.post(
+            AZURE_TTS_URL,
+            headers={"Content-Type": "application/json", "api-key": AZURE_API_KEY},
+            json={"model": "tts-1-hd", "input": storytitle, "voice": voice}
+        )
+        response.raise_for_status()
+        filename = f"tts_{uuid.uuid4().hex}.mp3"
+        local_path = os.path.join("temp", filename)
+        with open(local_path, "wb") as f:
+            f.write(response.content)
+        s3_key = f"{S3_PREFIX}{filename}"
+        s3.upload_file(local_path, AWS_BUCKET, s3_key)
+        cdn_url = f"{CDN_BASE}{s3_key}"
+        result[f"slide{slide_index}"] = {"storytitle": storytitle, "audio_url": cdn_url, "voice": voice}
+        os.remove(local_path)
+        slide_index += 1
+
+    # Slide 2..(N-1) : s1paragraph1.. (connected context is s1paragraph1)
+    for i in range(1, 50):
+        key = f"s{i}paragraph1"
+        if key not in paragraphs:
+            break
+        text_val = paragraphs[key]
+        st.write(f"🛠️ Processing {key}")
+        response = requests.post(
+            AZURE_TTS_URL,
+            headers={"Content-Type": "application/json", "api-key": AZURE_API_KEY},
+            json={"model": "tts-1-hd", "input": text_val, "voice": voice}
+        )
+        response.raise_for_status()
+        filename = f"tts_{uuid.uuid4().hex}.mp3"
+        local_path = os.path.join("temp", filename)
+        with open(local_path, "wb") as f:
+            f.write(response.content)
+        s3_key = f"{S3_PREFIX}{filename}"
+        s3.upload_file(local_path, AWS_BUCKET, s3_key)
+        cdn_url = f"{CDN_BASE}{s3_key}"
+        result[f"slide{slide_index}"] = {key: text_val, "audio_url": cdn_url, "voice": voice}
+        os.remove(local_path)
+        slide_index += 1
+
+    # Last slide: hookline + fixed footer
+    if "hookline" in paragraphs:
+        hookline_text = paragraphs["hookline"]
+        response = requests.post(
+            AZURE_TTS_URL,
+            headers={"Content-Type": "application/json", "api-key": AZURE_API_KEY},
+            json={"model": "tts-1-hd", "input": hookline_text, "voice": voice}
+        )
+        response.raise_for_status()
+        filename = f"tts_{uuid.uuid4().hex}.mp3"
+        local_path = os.path.join("temp", filename)
+        with open(local_path, "wb") as f:
+            f.write(response.content)
+        s3_key = f"{S3_PREFIX}{filename}"
+        s3.upload_file(local_path, AWS_BUCKET, s3_key)
+        cdn_url = f"{CDN_BASE}{s3_key}"
+        result[f"slide{slide_index}"] = {"hookline": hookline_text, "audio_url": cdn_url, "voice": voice}
+        os.remove(local_path)
+
+    return result
+
 def transliterate_to_devanagari(json_data):
-    """Transliterate only sXparagraph1 keys if content is Latin-script Hindi"""
     updated = {}
     for k, v in json_data.items():
+        # Only transliterate paragraph slides; keep title/hookline as is
         if k.startswith("s") and "paragraph1" in k and isinstance(v, str) and v.strip():
-            prompt = f"Transliterate this Hindi sentence (Latin) into Devanagari. Return only the transliteration:\n\n{v}"
+            prompt = f"""Transliterate this Hindi sentence (written in Latin script) into Hindi Devanagari script. Return only the transliterated text:\n\n{v}"""
             try:
-                r = client.chat.completions.create(
+                response = client.chat.completions.create(
                     model="gpt-5-chat",
                     messages=[
                         {"role": "system", "content": "You are a Hindi transliteration expert."},
-                        {"role": "user", "content": prompt.strip()},
-                    ],
+                        {"role": "user", "content": prompt.strip()}
+                    ]
                 )
-                updated[k] = r.choices[0].message.content.strip()
+                devanagari = response.choices[0].message.content.strip()
+                updated[k] = devanagari
             except Exception:
                 updated[k] = v
         else:
             updated[k] = v
     return updated
 
-def generate_hookline(title, summary, content_language="English"):
-    if content_language == "Hindi":
-        prompt = f"""
-'सुविचार' चैनल के लिए इस समाचार का एक छोटा, ध्यान आकर्षित करने वाला हुकलाइन वाक्य लिखें।
-- एक वाक्य
-- हैशटैग/इमोजी/अधिक विराम चिह्न नहीं
-- 120 वर्णों से कम
-शीर्षक: {title}
-सारांश: {summary}
-आउटपुट: केवल हुकलाइन
-"""
-    else:
-        prompt = f"""
-Write a short, attention-grabbing hookline for this news story.
-- One sentence
-- No hashtags/emojis/excess punctuation
-- Under 120 characters
-Title: {title}
-Summary: {summary}
-Return only the hookline.
-"""
-    try:
-        r = client.chat.completions.create(
-            model="gpt-5-chat",
-            messages=[
-                {"role": "system", "content": "You create crisp hooklines for news."},
-                {"role": "user", "content": prompt.strip()},
-            ],
-            temperature=0.5,
-        )
-        return r.choices[0].message.content.strip().strip('"')
-    except Exception:
-        return "This story might surprise you!"
-
 def generate_storytitle(title, summary, content_language="English"):
     if content_language == "Hindi":
         prompt = f"""
-अंग्रेज़ी शीर्षक और सारांश पढ़कर एक सरल, आकर्षक हिंदी शीर्षक बनाएं।
-- एक पंक्ति
-- उद्धरण न लगाएं
-शीर्षक: {title}
+आप एक समाचार शीर्षक विशेषज्ञ हैं। नीचे दी गई अंग्रेज़ी समाचार शीर्षक और सारांश को पढ़कर, उसी का अर्थ बनाए रखते हुए एक नया आकर्षक **हिंदी शीर्षक** बनाइए।
+
+अंग्रेज़ी शीर्षक: {title}
 सारांश: {summary}
-आउटपुट: केवल नया शीर्षक
+
+अनुरोध:
+- केवल एक पंक्ति
+- भाषा सरल और स्पष्ट हो
+- उद्धरण ("") शामिल न करें
+
+अब कृपया हिंदी शीर्षक दीजिए:
 """
         try:
-            r = client.chat.completions.create(
+            response = client.chat.completions.create(
                 model="gpt-5-chat",
                 messages=[
-                    {"role": "system", "content": "You generate clear Hindi news headlines."},
-                    {"role": "user", "content": prompt.strip()},
-                ],
+                    {"role": "system", "content": "You generate clear and catchy news headlines."},
+                    {"role": "user", "content": prompt.strip()}
+                ]
             )
-            return r.choices[0].message.content.strip().strip('"')
-        except Exception:
+            return response.choices[0].message.content.strip().strip('"')
+        except Exception as e:
+            print(f"❌ Storytitle generation failed: {e}")
             return title.strip()
     else:
         return title.strip()
 
-# =========================
-# TTS + Upload (order: title -> s1..sN -> hookline -> CTA)
-# =========================
-def _tts_bytes(text: str, voice: str) -> bytes:
-    """
-    Two providers:
-      - Azure OpenAI TTS (deployment-based): /openai/deployments/{deployment}/audio/speech
-      - Azure Speech Service (SSML): https://{region}.tts.speech.microsoft.com/cognitiveservices/v1
-    """
-    if TTS_PROVIDER == "openai":
-        # Azure OpenAI Audio (Text-to-Speech): ensure deployment exists & key/endpoint match the same resource
-        url = (
-            f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/"
-            f"{AZURE_TTS_DEPLOYMENT}/audio/speech?api-version={AZURE_OPENAI_API_VERSION}"
-        )
-        headers = {
-            "Content-Type": "application/json",
-            "api-key": AZURE_API_KEY,
-        }
-        payload = {
-            "input": text,
-            "voice": voice,   # e.g., "alloy", "nova" (must be supported by the deployment)
-            "format": "mp3",
-        }
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        if r.status_code == 401:
-            raise RuntimeError(f"Azure OpenAI TTS 401 — check key, endpoint & deployment: {r.text}")
-        r.raise_for_status()
-        return r.content
+# === Streamlit UI ===
+st.title("🧠 Web Story Content Generator")
 
-    elif TTS_PROVIDER == "speech":
-        # Azure Speech (Cognitive Services) — Neural voice names required, e.g., en-US-JennyNeural
-        if not AZURE_SPEECH_REGION:
-            raise RuntimeError("AZURE_SPEECH_REGION missing for Speech TTS")
-        url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
-        headers = {
-            "Ocp-Apim-Subscription-Key": AZURE_API_KEY,
-            "Content-Type": "application/ssml+xml",
-            "X-Microsoft-OutputFormat": "audio-16khz-128kbitrate-mono-mp3",
-        }
-        ssml = f"""
-<speak version="1.0" xml:lang="en-US">
-  <voice name="{voice}">
-    {text}
-  </voice>
-</speak>
-        """.strip()
-        r = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60)
-        if r.status_code == 401:
-            raise RuntimeError(f"Azure Speech 401 — check region & key: {r.text}")
-        r.raise_for_status()
-        return r.content
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Step:1", "Step:2", "Step:3","Step:4","Step:5","Step:6"])
 
-    else:
-        raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER}")
-
-def _upload_bytes_to_s3(data: bytes, ext: str = ".mp3") -> str:
-    filename = f"tts_{uuid.uuid4().hex}{ext}"
-    key = f"{S3_PREFIX}{filename}"
-    s3_client.put_object(Bucket=AWS_BUCKET, Key=key, Body=data, ContentType="audio/mpeg")
-    return f"{CDN_BASE}{key}"
-
-def synthesize_and_upload(paragraphs: dict, voice: str, add_cta=True) -> OrderedDict:
-    """
-    paragraphs must include:
-      - storytitle
-      - s1paragraph1..sNparagraph1
-      - hookline
-    Output format:
-      slide1: { storytitle, audio_url, voice }
-      slide2..: { sXparagraph1: "...", audio_url, voice }
-      last content slide: hookline
-      optional CTA final slide: fixed text + audio
-    """
-    result = OrderedDict()
-    os.makedirs("temp", exist_ok=True)
-
-    slide_index = 1
-
-    # Slide 1 — title
-    if "storytitle" in paragraphs and str(paragraphs["storytitle"]).strip():
-        audio = _upload_bytes_to_s3(_tts_bytes(paragraphs["storytitle"], voice))
-        result[f"slide{slide_index}"] = {
-            "storytitle": paragraphs["storytitle"],
-            "audio_url": audio,
-            "voice": voice,
-        }
-        slide_index += 1
-
-    # Slides 2..N — sXparagraph1 in numeric order
-    s_keys = sorted(
-        [k for k in paragraphs.keys() if k.startswith("s") and k.endswith("paragraph1")],
-        key=lambda x: int(re.findall(r"s(\d+)paragraph1", x)[0])
-    )
-    for k in s_keys:
-        txt = paragraphs[k]
-        if not isinstance(txt, str) or not txt.strip():
-            continue
-        audio = _upload_bytes_to_s3(_tts_bytes(txt, voice))
-        result[f"slide{slide_index}"] = {
-            k: txt,
-            "audio_url": audio,
-            "voice": voice,
-        }
-        slide_index += 1
-
-    # Last content slide — hookline
-    if "hookline" in paragraphs and isinstance(paragraphs["hookline"], str) and paragraphs["hookline"].strip():
-        audio = _upload_bytes_to_s3(_tts_bytes(paragraphs["hookline"], voice))
-        result[f"slide{slide_index}"] = {
-            "hookline": paragraphs["hookline"],
-            "audio_url": audio,
-            "voice": voice,
-        }
-        slide_index += 1
-
-    # Final CTA (fixed text & your canned audio url)
-    if add_cta:
-        result[f"slide{slide_index}"] = {
-            f"s{slide_index}paragraph1": "For Such Content Stay Connected with Suvichar Live\n\nRead | Share | Inspire",
-            "audio_url": DEFAULT_CTA_AUDIO,
-            "voice": voice,
-        }
-
-    return result
-
-# =========================
-# AMP helpers
-# =========================
-def generate_amp_slide(paragraph: str, audio_url: str):
-    # Minimal, clean slide w/ background audio and one big text block
-    return f"""
-<amp-story-page auto-advance-after="audio-bg">
-  <amp-story-grid-layer template="fill">
-    <amp-video id="audio-bg" autoplay width="1" height="1" layout="fixed">
-      <source type="audio/mpeg" src="{audio_url}">
-    </amp-video>
-  </amp-story-grid-layer>
-  <amp-story-grid-layer template="vertical">
-    <h3 style="padding:16px; line-height:1.25">{paragraph}</h3>
-  </amp-story-grid-layer>
-</amp-story-page>
-"""
-
-# =========================
-# Streamlit UI
-# =========================
-st.set_page_config(page_title="🧠 Web Story Content Generator", page_icon="📰", layout="wide")
-st.title("📰 Suvichaar — Web Story Content Generator")
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Step 1", "Step 2", "Step 3", "AMP Builder", "Publish", "Cover Image"])
-
-# -------------------- Tab 1 --------------------
+# 🧠 Streamlit UI – Tab 1
 with tab1:
-    st.subheader("Generalized Web Story Prompt Generator (No Polaris)")
+    st.title("🧠 Generalized Web Story Prompt Generator")
+
     url = st.text_input("Enter a news article URL")
-    persona = st.selectbox("Choose audience persona:", ["genz", "millenial", "working professionals", "creative thinkers", "spiritual explorers"])
     content_language = st.selectbox("Choose content language", ["English", "Hindi"])
-    number = st.number_input("Enter # of main slides (excluding Headline & Hookline)", min_value=0, max_value=1000, value=6, step=1)
-    st.caption("Total slides = Headline (1) + main slides + Hookline (1). Enforced between 8 and 10 total. CTA is extra.")
+    total_slides = st.number_input(
+        "Total slides (including Headline and Hookline)",
+        min_value=MIN_TOTAL_SLIDES,
+        max_value=MAX_TOTAL_SLIDES,
+        value=MIN_TOTAL_SLIDES,
+        step=1
+    )
 
     if st.button("🚀 Submit and Generate JSON"):
-        if url and persona:
-            with st.spinner("Analyzing article and generating outline..."):
+        if url:
+            with st.spinner("Analyzing the article and generating prompts..."):
                 try:
+                    # Extract + Analyze
                     title, summary, full_text = extract_article(url)
                     sentiment = get_sentiment(summary or full_text)
                     result = detect_category_and_subcategory(full_text, content_language)
-                    category, subcategory, emotion = result["category"], result["subcategory"], result["emotion"]
+                    category = result["category"]
+                    subcategory = result["subcategory"]
+                    emotion = result["emotion"]
 
-                    # clamp main slides based on total min/max
-                    main_count = clamp_main_slides(number)
-
-                    # Generate outline
-                    outline = title_script_generator(category, subcategory, emotion, full_text, content_language)
-
-                    # Build the flattened story structure
+                    # Headline (slide 1)
                     storytitle = generate_storytitle(title, summary, content_language)
-                    hookline   = generate_hookline(title, summary, content_language)
 
-                    structured = OrderedDict()
-                    structured["storytitle"] = storytitle
-                    # s1..sN (main slides)
-                    structured.update(restructure_slide_output(outline, main_count))
-                    structured["hookline"] = hookline
+                    # Connected (slide 2)
+                    connected_context = generate_connected_context(title, summary, content_language)
 
+                    # Middle slides count = total - 3 (headline + connected + hookline)
+                    middle_count = max(0, total_slides - 3)
+                    middle_slides = title_script_generator(
+                        category, subcategory, emotion, full_text, content_language, middle_count=middle_count
+                    )
+
+                    # Create a safe, short hookline seed from the title/summary
                     if content_language == "Hindi":
-                        structured = transliterate_to_devanagari(structured)
+                        hook_seed = "यह कहानी आपको सोचने पर मजबूर कर देगी."
+                    else:
+                        hook_seed = "This story might surprise you."
 
-                    # Save + offer download
-                    ts = int(time.time())
-                    fname = f"structured_slides_{ts}.json"
-                    with open(fname, "w", encoding="utf-8") as f:
-                        json.dump(structured, f, indent=2, ensure_ascii=False)
+                    final_hookline = generate_fixed_hookline(hook_seed, content_language)
 
-                    with open(fname, "r", encoding="utf-8") as f:
-                        st.success("✅ Prompt JSON ready")
-                        st.download_button("⬇️ Download JSON", f.read(), file_name=fname, mime="application/json")
+                    # Flatten into story JSON (Slide 1: storytitle, Slides 2..N-1: s1.., Slide N: hookline)
+                    structured_output = OrderedDict()
+                    structured_output["storytitle"] = storytitle
+
+                    # s1paragraph1 = connected context
+                    middle_struct = restructure_slide_output_for_middle([connected_context] + middle_slides)
+
+                    for i in range(1, len(middle_struct) + 1):
+                        structured_output[f"s{i}paragraph1"] = middle_struct[f"s{i}paragraph1"]
+
+                    structured_output["hookline"] = final_hookline
+
+                    # Hindi transliteration (only for paragraphs)
+                    if content_language == "Hindi":
+                        structured_output = transliterate_to_devanagari(structured_output)
+
+                    # Save + Download JSON
+                    timestamp = int(time.time())
+                    filename = f"structured_slides_{timestamp}.json"
+                    with open(filename, "w", encoding="utf-8") as f:
+                        json.dump(structured_output, f, indent=2, ensure_ascii=False)
+
+                    with open(filename, "r", encoding="utf-8") as f:
+                        st.success("✅ Prompt generation complete!! Click below to download:")
+                        st.download_button(
+                            label=f"⬇️ Download JSON ({timestamp})",
+                            data=f.read(),
+                            file_name=filename,
+                            mime="application/json"
+                        )
+
+                    # Show a quick preview of how many slides it represents
+                    st.info(f"Total slides targeted: {total_slides}  ➜ Headline (1) + Middle ({total_slides-3}) + Hookline (1) + Connected (1)")
 
                 except Exception as e:
-                    st.error(f"❌ Error: {e}")
+                    st.error(f"❌ Error: {str(e)}")
         else:
-            st.warning("Please enter a URL and choose a persona.")
+            st.warning("Please enter a valid URL.")
 
-# -------------------- Tab 2 --------------------
 with tab2:
-    st.subheader("🎙️ Text-to-Speech → S3")
-    st.caption(f"TTS provider: **{TTS_PROVIDER}**")
-    voice_label = st.selectbox("Choose Voice", list(voice_options.values()))
+    st.title("🎙️ Text-to-Speech to S3")
     uploaded_file = st.file_uploader("Upload structured slide JSON", type=["json"])
+    voice_label = st.selectbox("Choose Voice", list(voice_options.values()))
 
     if uploaded_file and voice_label:
         paragraphs = json.load(uploaded_file)
-        st.success(f"✅ Loaded {len(paragraphs)} fields")
+        st.success(f"✅ Loaded {len(paragraphs)} keys")
 
         if st.button("🚀 Generate TTS + Upload to S3"):
-            with st.spinner("Synthesizing & uploading..."):
-                try:
-                    output = synthesize_and_upload(paragraphs, voice_label, add_cta=True)
-                except Exception as e:
-                    st.error(f"TTS error: {e}")
-                    st.stop()
-                st.success("✅ Uploaded to S3")
-
-                ts = int(time.time())
-                out_name = f"tts_output_{ts}.json"
-                with open(out_name, "w", encoding="utf-8") as f:
+            with st.spinner("Please wait..."):
+                output = synthesize_and_upload(paragraphs, voice_label)
+                st.success("✅ Done uploading to S3!")
+                timestamp = int(time.time())
+                output_filename = f"tts_output_{timestamp}.json"
+        
+                # Save TTS output
+                with open(output_filename, "w", encoding="utf-8") as f:
                     json.dump(output, f, indent=2, ensure_ascii=False)
-
-                # fixed image for remotion/cover flows (configurable)
+        
+                # Remotion generation (neutral image)
                 fixed_image_url = DEFAULT_SLIDE_IMAGE_URL
+                remotion_filename = generate_remotion_input(output, fixed_image_url, author_name="Suvichaar")
+        
+                # Download TTS JSON
+                with open(output_filename, "r", encoding="utf-8") as f:
+                    st.download_button(
+                        label="⬇️ Download Output JSON",
+                        data=f.read(),
+                        file_name=output_filename,
+                        mime="application/json"
+                    )
 
-                # Offer download
-                with open(out_name, "r", encoding="utf-8") as f:
-                    st.download_button("⬇️ Download TTS Output", f.read(), file_name=out_name, mime="application/json")
-
-# -------------------- Tab 3 --------------------
 with tab3:
-    st.subheader("🧩 Save modified file (HTML + JSON Zip)")
-    up_json = st.file_uploader("📤 Upload Full Slide JSON (with slide1..)", type=["json"])
-    up_html = st.file_uploader("📄 Upload HTML template with placeholders", type=["html"])
+    st.title("🧩 Saving modified file")
+    uploaded_file = st.file_uploader("📤 Upload Full Slide JSON (with slide1 to slideN)", type=["json"])
 
-    def replace_placeholders_in_html(html_text, json_data):
-        storytitle = json_data.get("slide1", {}).get("storytitle", "")
-        storytitle_url = json_data.get("slide1", {}).get("audio_url", "")
-        hookline = ""
-        hookline_url = ""
-        # find last slide that has hookline
-        for k in sorted(json_data.keys(), key=lambda x: int(x.replace("slide",""))):
-            if "hookline" in json_data[k]:
-                hookline = json_data[k]["hookline"]
-                hookline_url = json_data[k].get("audio_url","")
-        html_text = html_text.replace("{{storytitle}}", storytitle)
-        html_text = html_text.replace("{{storytitle_audiourl}}", storytitle_url)
-        html_text = html_text.replace("{{hookline}}", hookline)
-        html_text = html_text.replace("{{hookline_audiourl}}", hookline_url)
-        return html_text
+    if uploaded_file:
+        json_data = json.load(uploaded_file)
+        st.success("✅ JSON Loaded")
 
-    def modify_tab4_json(original_json):
-        """Trim & re-map to a compact sX structure if needed (kept for backwards compat)."""
-        updated_json = OrderedDict()
-        slide_number = 2
-        # start from slide3 to build a compact view
-        for i in range(3, 100):
-            old_key = f"slide{i}"
-            if old_key not in original_json:
-                break
-            content = original_json[old_key]
-            new_key = f"slide{slide_number}"
-            for k, v in content.items():
-                if k.endswith("paragraph1"):
-                    para_key = f"s{slide_number}paragraph1"
-                    audio_key = f"audio_url{slide_number}"
-                    updated_json[new_key] = {
-                        para_key: v,
-                        audio_key: content.get("audio_url",""),
-                        "voice": content.get("voice","")
-                    }
-                    break
-            slide_number += 1
-        return updated_json
+        try:
+            with open("test.html", "r", encoding="utf-8") as f:
+                html_template = f.read()
+        except FileNotFoundError:
+            st.error("❌ Could not find `templates/test.html`. Please make sure it exists.")
+        else:
+            updated_html = replace_placeholders_in_html(html_template, json_data)
+            updated_json = modify_tab4_json(json_data)
 
-    if up_json and up_html:
-        json_data = json.load(up_json)
-        html_template = up_html.read().decode("utf-8")
+            if st.button("🎯 Generate Final HTML + Trimmed JSON (ZIP)"):
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                zip_filename = f"Output_bundle_{ts}.zip"
 
-        updated_html = replace_placeholders_in_html(html_template, json_data)
-        updated_json = modify_tab4_json(json_data)
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+                    zipf.writestr(f"updated_test_{ts}.html", updated_html)
+                    zipf.writestr(f"output_{ts}.json", json.dumps(updated_json, indent=2, ensure_ascii=False))
+                buffer.seek(0)
 
-        if st.button("🎯 Generate Final HTML + Trimmed JSON (ZIP)"):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            zip_filename = f"Output_bundle_{ts}.zip"
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr(f"updated_{ts}.html", updated_html)
-                zf.writestr(f"output_{ts}.json", json.dumps(updated_json, indent=2, ensure_ascii=False))
-            buf.seek(0)
-            st.download_button("⬇️ Download ZIP", buf, file_name=zip_filename, mime="application/zip")
+                st.download_button(
+                    label="⬇️ Download ZIP with HTML + JSON",
+                    data=buffer,
+                    file_name=zip_filename,
+                    mime="application/zip"
+                )
 
-# -------------------- Tab 4 (AMP Builder) --------------------
 with tab4:
-    st.subheader("🎞️ AMP Web Story Builder (Audio + Animation)")
-    uploaded_html_file = st.file_uploader("📄 Upload AMP Template HTML (must contain <!--INSERT_SLIDES_HERE-->)", type=["html"], key="html_upload_tab3")
-    uploaded_json_file = st.file_uploader("📦 Upload TTS Output JSON (from Step 2)", type=["json"], key="json_upload_tab3")
+    #
+    # Streamlit UI
+    st.title("🎞️ AMP Web Story Generator with Full Animation and Audio")
+    
+    # Function to generate an AMP slide using paragraph and audio URL
+    def generate_slide(paragraph: str, audio_url: str):
+        # Neutral, no Polaris visuals
+        return f"""
+        <amp-story-page auto-advance-after="page-audio" class="i-amphtml-layout-container" i-amphtml-layout="container">
+            <amp-story-grid-layer template="fill">
+                <amp-img layout="fill" src="{DEFAULT_SLIDE_IMAGE_URL}" alt="slide" disable-inline-width="true"></amp-img>
+            </amp-story-grid-layer>
+
+            <amp-story-grid-layer template="fill">
+                <amp-video id="page-audio" autoplay layout="fixed" width="1" height="1">
+                    <source type="audio/mpeg" src="{audio_url}">
+                </amp-video>
+            </amp-story-grid-layer>
+
+            <amp-story-grid-layer template="vertical" aspect-ratio="412:618" style="--aspect-ratio:412/618;">
+                <div class="page-fullbleed-area">
+                    <div class="page-safe-area">
+                        <h3 class="story-text" style="padding:16px; font-size:22px; line-height:1.35; font-weight:600;">
+                            {paragraph}
+                        </h3>
+                    </div>
+                </div>
+            </amp-story-grid-layer>
+        </amp-story-page>
+        """
+
+    uploaded_html_file = st.file_uploader("📄 Upload AMP Template HTML (with <!--INSERT_SLIDES_HERE-->)", type=["html"], key="html_upload_tab3")
+    uploaded_json_file = st.file_uploader("📦 Upload Output JSON", type=["json"], key="json_upload_tab3")
 
     if uploaded_html_file and uploaded_json_file:
         try:
@@ -672,264 +693,416 @@ with tab4:
             if "<!--INSERT_SLIDES_HERE-->" not in template_html:
                 st.error("❌ Placeholder <!--INSERT_SLIDES_HERE--> not found in uploaded HTML.")
             else:
-                # build slides in numeric order
                 all_slides = ""
-                keys_sorted = sorted(output_data.keys(), key=lambda x: int(x.replace("slide","")))
-                for k in keys_sorted:
-                    data = output_data[k]
-                    # resolve paragraph field name
-                    para = None
-                    # storytitle
-                    if "storytitle" in data:
-                        para = data["storytitle"]
-                    # hookline
-                    elif "hookline" in data:
-                        para = data["hookline"]
-                    else:
-                        # sXparagraph1
-                        for kk in data.keys():
-                            if kk.endswith("paragraph1"):
-                                para = data[kk]
-                                break
-                    audio_url = data.get("audio_url", "")
-                    if para and audio_url:
-                        raw = str(para).replace("’", "'").replace('"', '&quot;')
+                # Build slides in ascending slide order
+                slide_keys = [k for k in output_data.keys() if k.startswith("slide")]
+                if not slide_keys:
+                    # construct from sX keys if needed
+                    pass
+
+                # If data is Suvichaar-style (slide1 has storytitle, then slide2.. with sXparagraph1)
+                # Recompose paragraphs + audios in order
+                ordered_keys = sorted(output_data.keys(), key=lambda x: int(x.replace("slide", "")) if x.startswith("slide") else 9999)
+
+                # Fallback to constructing from generic keys (storytitle, s1paragraph1..., hookline)
+                if not ordered_keys:
+                    constructed = OrderedDict()
+                    idx = 1
+                    if "storytitle" in output_data:
+                        constructed["slide1"] = {
+                            "s1paragraph1": output_data["storytitle"],
+                            "audio_url1": output_data.get("slide1", {}).get("audio_url", "")
+                        }
+                        idx += 1
+                    p_i = 1
+                    while f"s{p_i}paragraph1" in output_data:
+                        constructed[f"slide{idx}"] = {
+                            f"s{idx}paragraph1": output_data[f"s{p_i}paragraph1"],
+                            f"audio_url{idx}": output_data.get(f"slide{idx}", {}).get("audio_url", "")
+                        }
+                        idx += 1
+                        p_i += 1
+                    if "hookline" in output_data:
+                        constructed[f"slide{idx}"] = {
+                            f"s{idx}paragraph1": output_data["hookline"],
+                            f"audio_url{idx}": output_data.get(f"slide{idx}", {}).get("audio_url", "")
+                        }
+                    output_data = constructed
+                    ordered_keys = sorted(output_data.keys(), key=lambda x: int(x.replace("slide", "")))
+
+                for key in ordered_keys:
+                    slide_num = key.replace("slide", "")
+                    data = output_data[key]
+                    para_key = f"s{slide_num}paragraph1"
+                    audio_key = f"audio_url{slide_num}"
+
+                    if para_key in data and audio_key in data:
+                        raw = str(data[para_key]).replace("’", "'").replace('"', '&quot;')
                         paragraph = textwrap.shorten(raw, width=180, placeholder="...")
-                        all_slides += generate_amp_slide(paragraph, audio_url)
+                        audio_url = data[audio_key] or ""
+                        all_slides += generate_slide(paragraph, audio_url)
 
                 final_html = template_html.replace("<!--INSERT_SLIDES_HERE-->", all_slides)
                 filename = f"pre-final_amp_story_{int(time.time())}.html"
 
-                st.success("✅ Final AMP HTML generated!")
-                st.download_button("📥 Download Final AMP HTML", final_html, file_name=filename, mime="text/html")
+                st.success("✅ Final AMP HTML generated successfully!")
+                st.download_button(
+                    label="📥 Download Final AMP HTML",
+                    data=final_html,
+                    file_name=filename,
+                    mime="text/html"
+                )
 
         except Exception as e:
-            st.error(f"⚠️ Error: {e}")
+            st.error(f"⚠️ Error: {str(e)}")
 
-# -------------------- Tab 5 (Publish) --------------------
 with tab5:
-    st.header("Publish to S3 (HTML + Metadata)")
+    st.header("Content Submission Form")
+
     if "last_title" not in st.session_state:
         st.session_state.last_title = ""
         st.session_state.meta_description = ""
         st.session_state.meta_keywords = ""
 
     story_title = st.text_input("Story Title")
-    # Auto meta (optional)
+    
     if story_title.strip() and story_title != st.session_state.last_title:
-        with st.spinner("Generating meta description/keywords/tags..."):
-            messages = [{
-                "role": "user",
-                "content": f"Generate: 1) short SEO meta description 2) meta keywords (comma) 3) filter tags (comma) for '{story_title}'"
-            }]
+        with st.spinner("Generating meta description, keywords, and filter tags..."):
+            messages = [
+                {
+                    "role": "user",
+                    "content": f"""
+                    Generate the following for a web story titled '{story_title}':
+                    1. A short SEO-friendly meta description
+                    2. Meta keywords (comma separated)
+                    3. Relevant filter tags (comma separated, suitable for categorization and content filtering)"""
+                }
+            ]
             try:
-                r = client.chat.completions.create(
-                    model="gpt-5-chat", messages=messages, max_tokens=300, temperature=0.5
+                response = client.chat.completions.create(
+                    model="gpt-5-chat",
+                    messages=messages,
+                    max_tokens=300,
+                    temperature=0.5,
                 )
-                out = r.choices[0].message.content or ""
-                desc = re.search(r"[Dd]escription\s*[:\-]\s*(.+)", out)
-                keys = re.search(r"[Kk]eywords\s*[:\-]\s*(.+)", out)
-                tags = re.search(r"[Ff]ilter\s*[Tt]ags\s*[:\-]\s*(.+)", out)
+                output = response.choices[0].message.content
+    
+                # Extract metadata using regex
+                desc = re.search(r"[Dd]escription\s*[:\-]\s*(.+)", output)
+                keys = re.search(r"[Kk]eywords\s*[:\-]\s*(.+)", output)
+                tags = re.search(r"[Ff]ilter\s*[Tt]ags\s*[:\-]\s*(.+)", output)
+    
                 st.session_state.meta_description = desc.group(1).strip() if desc else ""
                 st.session_state.meta_keywords = keys.group(1).strip() if keys else ""
                 st.session_state.generated_filter_tags = tags.group(1).strip() if tags else ""
+    
             except Exception as e:
-                st.warning(f"Meta gen error: {e}")
+                st.warning(f"Error: {e}")
             st.session_state.last_title = story_title
 
     meta_description = st.text_area("Meta Description", value=st.session_state.meta_description)
-    meta_keywords    = st.text_input("Meta Keywords", value=st.session_state.meta_keywords)
-    content_type = st.selectbox("Content type", ["News", "Article"])
-    language     = st.selectbox("Language", ["en-US", "hi"])
-    image_url    = st.text_input("Cover Image URL", value=DEFAULT_COVER_URL)
-    uploaded_prefinal = st.file_uploader("💾 Upload pre-final AMP HTML", type=["html","htm"], key="prefinal_upload")
+    meta_keywords = st.text_input("Meta Keywords (comma separated)", value=st.session_state.meta_keywords)
+    content_type = st.selectbox("Select your contenttype", ["News", "Article"])
+    language = st.selectbox("Select your Language", ["en-US", "hi"])
+    image_url = st.text_input("Enter your Image URL")
+    uploaded_prefinal = st.file_uploader("💾 Upload pre-final AMP HTML (optional)", type=["html","htm"], key="prefinal_upload")
+    
+    if uploaded_prefinal is None:
+        st.error("Please upload a pre-final AMP HTML file before submitting.")
 
-    categories = st.selectbox("Categories", ["Art","Travel","Entertainment","Literature","Books","Sports","History","Culture","Wildlife","Spiritual"])
-    default_tags = ["News","Breaking","Update","Suvichaar Stories"]
-    tag_input = st.text_input("Filter Tags (comma)", value=st.session_state.get("generated_filter_tags", ", ".join(default_tags)))
-    use_custom_cover = st.radio("Custom cover image URL?", ("No","Yes"))
-    cover_image_url = st.text_input("Custom Cover Image URL") if use_custom_cover == "Yes" else image_url
+    categories = st.selectbox("Select your Categories", ["Art", "Travel", "Entertainment", "Literature", "Books", "Sports", "History", "Culture", "Wildlife", "Spiritual", "Food"])
+
+    default_tags = [
+        "Indian News",
+        "Current Affairs",
+        "Public Interest",
+        "Suvichaar Stories"
+    ]
+    tag_input = st.text_input(
+        "Enter Filter Tags (comma separated):",
+        value=st.session_state.get("generated_filter_tags", ", ".join(default_tags)),
+        help="Example: News, India, Updates"
+    )
+
+    use_custom_cover = st.radio("Do you want to add a custom cover image URL?", ("No", "Yes"))
+    if use_custom_cover == "Yes":
+        cover_image_url = st.text_input("Enter your custom Cover Image URL")
+    else:
+        cover_image_url = image_url or DEFAULT_COVER_URL
 
     with st.form("content_form"):
         submit_button = st.form_submit_button("Submit")
 
-    if submit_button:
-        missing = []
-        if not story_title.strip(): missing.append("Story Title")
-        if not meta_description.strip(): missing.append("Meta Description")
-        if not meta_keywords.strip(): missing.append("Meta Keywords")
-        if not content_type.strip(): missing.append("Content Type")
-        if not language.strip(): missing.append("Language")
-        if not image_url.strip(): missing.append("Image URL")
-        if not tag_input.strip(): missing.append("Filter Tags")
-        if not categories.strip(): missing.append("Category")
-        if not uploaded_prefinal: missing.append("pre-final AMP HTML")
-        if missing:
-            st.error("❌ Please fill required fields:\n- " + "\n- ".join(missing))
+if 'submit_button' in locals() and submit_button:
+    # Validation before processing
+    missing_fields = []
+    if not story_title.strip(): missing_fields.append("Story Title")
+    if not meta_description.strip(): missing_fields.append("Meta Description")
+    if not meta_keywords.strip(): missing_fields.append("Meta Keywords")
+    if not content_type.strip(): missing_fields.append("Content Type")
+    if not language.strip(): missing_fields.append("Language")
+    if not image_url.strip(): st.info("No Image URL provided. Using default.")
+    if not tag_input.strip(): missing_fields.append("Filter Tags")
+    if not categories.strip(): missing_fields.append("Category")
+    if not uploaded_prefinal: missing_fields.append("Raw HTML File")
+
+    if missing_fields:
+        st.error(f"❌ Please fill all required fields before submitting:\n- " + "\n- ".join(missing_fields))
+    else:
+        st.markdown("### Submitted Data")
+        st.write(f"**Story Title:** {story_title}")
+        st.write(f"**Meta Description:** {meta_description}")
+        st.write(f"**Meta Keywords:** {meta_keywords}")
+        st.write(f"**Content Type:** {content_type}")
+        st.write(f"**Language:** {language}")
+
+    key_path = "media/default.png"
+    uploaded_url = ""
+
+    try:
+        nano, slug_nano, canurl, canurl1 = generate_slug_and_urls(story_title)
+        page_title = f"{story_title} | Suvichaar"
+    except Exception as e:
+        st.error(f"Error generating canonical URLs: {e}")
+        nano = slug_nano = canurl = canurl1 = page_title = ""
+
+    # Image URL handling
+    if image_url:
+        filename = os.path.basename(urlparse(image_url).path)
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in [".jpg", ".jpeg", ".png", ".gif"]:
+            ext = ".jpg"
+        if image_url.startswith("https://stories.suvichaar.org/"):
+            uploaded_url = image_url
+            key_path = "/".join(urlparse(image_url).path.split("/")[2:])
         else:
-            st.markdown("### Submitted Data")
-            st.write(f"**Story Title:** {story_title}")
-            st.write(f"**Meta Description:** {meta_description}")
-            st.write(f"**Meta Keywords:** {meta_keywords}")
-            st.write(f"**Content Type:** {content_type}")
-            st.write(f"**Language:** {language}")
-
             try:
-                nano, slug_nano, canurl, canurl1 = generate_slug_and_urls(story_title)
-                page_title = f"{story_title} | Suvichaar"
+                response = requests.get(image_url, timeout=10)
+                response.raise_for_status()
+                unique_filename = f"{uuid.uuid4().hex}{ext}"
+                s3_key = f"{S3_PREFIX}{unique_filename}"
+                s3_client.put_object(
+                    Bucket=AWS_BUCKET,
+                    Key=s3_key,
+                    Body=response.content,
+                    ContentType=response.headers.get("Content-Type", "image/jpeg"),
+                )
+                uploaded_url = f"{CDN_BASE}{s3_key}"
+                key_path = s3_key
+                st.success("Image uploaded successfully!")
             except Exception as e:
-                st.error(f"Canonical URL error: {e}")
-                nano = slug_nano = canurl = canurl1 = page_title = ""
+                st.warning(f"Failed to fetch/upload image. Using fallback. Error: {e}")
+                uploaded_url = ""
+    else:
+        uploaded_url = DEFAULT_COVER_URL
 
-            # Upload image if not already on CDN
-            key_path = "media/default.png"
-            uploaded_url = ""
-            try:
-                if image_url.startswith("https://media.suvichaar.org/") or image_url.startswith("http://media.suvichaar.org/"):
-                    uploaded_url = image_url
-                    key_path = urlparse(image_url).path.lstrip("/")
-                else:
-                    resp = requests.get(image_url, timeout=10)
-                    resp.raise_for_status()
-                    ext = os.path.splitext(urlparse(image_url).path)[1].lower() or ".jpg"
-                    unique_filename = f"{uuid.uuid4().hex}{ext}"
-                    s3_key = f"{S3_PREFIX}{unique_filename}"
-                    s3_client.put_object(Bucket=AWS_BUCKET, Key=s3_key, Body=resp.content, ContentType=resp.headers.get("Content-Type","image/jpeg"))
-                    uploaded_url = f"{CDN_BASE}{s3_key}"
-                    key_path = s3_key
-                    st.success("Image uploaded to CDN!")
-            except Exception as e:
-                st.warning(f"Cover upload failed, using provided URL. Error: {e}")
-                uploaded_url = image_url
+    try:
+        # use the uploaded HTML as the working template
+        html_template = uploaded_prefinal.read().decode("utf-8")
+    
+        user_mapping = {
+            "Mayank": "https://www.instagram.com/iamkrmayank?igsh=eW82NW1qbjh4OXY2&utm_source=qr",
+            "Onip": "https://www.instagram.com/onip.mathur/profilecard/?igsh=MW5zMm5qMXhybGNmdA==",
+            "Naman": "https://njnaman.in/"
+        }
 
-            # Build responsive variants via CloudFront lambda@edge encoding
-            parsed_path = key_path
-            def encode_resize(w,h):
-                template = {"bucket": AWS_BUCKET, "key": parsed_path, "edits":{"resize":{"width":w,"height":h,"fit":"cover"}}}
-                return f"{CDN_PREFIX_MEDIA}{base64.urlsafe_b64encode(json.dumps(template).encode()).decode()}"
+        filter_tags = [tag.strip() for tag in tag_input.split(",") if tag.strip()]
+        category_mapping = {
+            "Art": 1, "Travel": 2, "Entertainment": 3, "Literature": 4, "Books": 5,
+            "Sports": 6, "History": 7, "Culture": 8, "Wildlife": 9, "Spiritual": 10, "Food": 11
+        }
 
-            # Use uploaded HTML as template
-            try:
-                html_template = uploaded_prefinal.read().decode("utf-8")
-                html_template = html_template.replace("{{publishedtime}}", datetime.now(timezone.utc).isoformat(timespec='seconds'))
-                html_template = html_template.replace("{{modifiedtime}}", datetime.now(timezone.utc).isoformat(timespec='seconds'))
-                html_template = html_template.replace("{{storytitle}}", story_title)
-                html_template = html_template.replace("{{metadescription}}", meta_description)
-                html_template = html_template.replace("{{metakeywords}}", meta_keywords)
-                html_template = html_template.replace("{{contenttype}}", content_type)
-                html_template = html_template.replace("{{lang}}", language)
-                html_template = html_template.replace("{{pagetitle}}", page_title)
-                html_template = html_template.replace("{{canurl}}", canurl)
-                html_template = html_template.replace("{{canurl1}}", canurl1)
-                html_template = html_template.replace("{{image0}}", uploaded_url)
-                html_template = html_template.replace("{{potraitcoverurl}}", encode_resize(640,853))
-                html_template = html_template.replace("{{msthumbnailcoverurl}}", encode_resize(300,300))
-                # cleanup {url}
-                html_template = re.sub(r'href="\{(https://[^}]+)\}"', r'href="\\1"', html_template)
-                html_template = re.sub(r'src="\{(https://[^}]+)\}"', r'src="\\1"', html_template)
+        filternumber = category_mapping.get(categories, 1)
+        selected_user = random.choice(list(user_mapping.keys()))
+        html_template = html_template.replace("{{user}}", selected_user)
+        html_template = html_template.replace("{{userprofileurl}}", user_mapping[selected_user])
+        html_template = html_template.replace("{{publishedtime}}", datetime.now(timezone.utc).isoformat(timespec='seconds'))
+        html_template = html_template.replace("{{modifiedtime}}", datetime.now(timezone.utc).isoformat(timespec='seconds'))
+        html_template = html_template.replace("{{storytitle}}", story_title)
+        html_template = html_template.replace("{{metadescription}}", meta_description)
+        html_template = html_template.replace("{{metakeywords}}", meta_keywords)
+        html_template = html_template.replace("{{contenttype}}", content_type)
+        html_template = html_template.replace("{{lang}}", language)
+        html_template = html_template.replace("{{pagetitle}}", page_title)
+        html_template = html_template.replace("{{canurl}}", canurl)
+        html_template = html_template.replace("{{canurl1}}", canurl1)
 
-                st.markdown("### Final Modified HTML")
-                st.code(html_template[:10000], language="html")  # preview head
-
-                # Metadata JSON
-                category_mapping = {"Art":1,"Travel":2,"Entertainment":3,"Literature":4,"Books":5,"Sports":6,"History":7,"Culture":8,"Wildlife":9,"Spiritual":10}
-                filternumber = category_mapping[categories]
-                filter_tags = [t.strip() for t in tag_input.split(",") if t.strip()]
-                metadata_dict = {
-                    "story_title": story_title,
-                    "categories": filternumber,
-                    "filterTags": filter_tags,
-                    "story_uid": nano,
-                    "story_link": canurl,
-                    "storyhtmlurl": canurl1,
-                    "urlslug": slug_nano,
-                    "cover_image_link": (cover_image_url or uploaded_url),
-                    "publisher_id": 1,
-                    "story_logo_link": "https://media.suvichaar.org/filters:resize/96x96/media/brandasset/suvichaariconblack.png",
-                    "keywords": meta_keywords,
-                    "metadescription": meta_description,
-                    "lang": language,
+        # Replace image placeholders
+        if image_url.startswith("http://media.suvichaar.org") or image_url.startswith("https://media.suvichaar.org"):
+            html_template = html_template.replace("{{image0}}", image_url)
+            parsed_cdn_url = urlparse(image_url)
+            cdn_key_path = parsed_cdn_url.path.lstrip("/")
+            resize_presets = {
+                "potraitcoverurl": (640, 853),
+                "msthumbnailcoverurl": (300, 300),
+            }
+            for label, (width, height) in resize_presets.items():
+                template = {
+                    "bucket": AWS_BUCKET,
+                    "key": cdn_key_path,
+                    "edits": {"resize": {"width": width, "height": height, "fit": "cover"}}
                 }
+                encoded = base64.urlsafe_b64encode(json.dumps(template).encode()).decode()
+                final_url = f"{CDN_PREFIX_MEDIA}{encoded}"
+                html_template = html_template.replace(f"{{{label}}}", final_url)
+        else:
+            # Fallback to default images if external/non-CDN
+            html_template = html_template.replace("{{image0}}", uploaded_url or DEFAULT_COVER_URL)
+            for label in ["potraitcoverurl", "msthumbnailcoverurl"]:
+                html_template = html_template.replace(f"{{{label}}}", uploaded_url or DEFAULT_COVER_URL)
 
-                # Upload HTML to site bucket
-                site_bucket = "suvichaarstories"
-                s3_client.put_object(Bucket=site_bucket, Key=f"{slug_nano}.html", Body=html_template.encode("utf-8"), ContentType="text/html")
-                final_story_url = f"https://suvichaar.org/stories/{slug_nano}"
-                st.success("✅ HTML uploaded to S3")
-                st.markdown(f"🔗 **Live Story URL:** [{final_story_url}]({final_story_url})")
+        # Cleanup incorrect {url} wrapping
+        html_template = re.sub(r'href="\{(https://[^}]+)\}"', r'href="\1"', html_template)
+        html_template = re.sub(r'src="\{(https://[^}]+)\}"', r'src="\1"', html_template)
 
-                # ZIP for download
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w") as zf:
-                    zf.writestr(f"{slug_nano}.html", html_template)
-                    zf.writestr(f"{slug_nano}_metadata.json", json.dumps(metadata_dict, indent=4))
-                zip_buffer.seek(0)
-                st.download_button("📦 Download HTML + Metadata ZIP", data=zip_buffer, file_name=f"{story_title}.zip", mime="application/zip")
+        st.markdown("### Final Modified HTML")
+        st.code(html_template, language="html")
 
-            except Exception as e:
-                st.error(f"Error processing HTML: {e}")
+        # ----------- Generate and Provide Metadata JSON -------------
+        metadata_dict = {
+            "story_title": story_title,
+            "categories": filternumber,
+            "filterTags": filter_tags,
+            "story_uid": nano,
+            "story_link": canurl,
+            "storyhtmlurl": canurl1,
+            "urlslug": slug_nano,
+            "cover_image_link": cover_image_url,
+            "publisher_id": 1,
+            "story_logo_link": "https://media.suvichaar.org/filters:resize/96x96/media/brandasset/suvichaariconblack.png",
+            "keywords": meta_keywords,
+            "metadescription": meta_description,
+            "lang": language
+        }
 
-# -------------------- Tab 6 (Cover Image) --------------------
+        s3_key = f"{slug_nano}.html"
+        s3_client.put_object(
+            Bucket="suvichaarstories",
+            Key=s3_key,
+            Body=html_template.encode("utf-8"),
+            ContentType="text/html",
+        )
+
+        final_story_url = f"https://suvichaar.org/stories/{slug_nano}"  # canurl
+        st.success("✅ HTML uploaded successfully to S3!")
+        st.markdown(f"🔗 **Live Story URL:** [Click to view your story]({final_story_url})")
+        
+        json_str = json.dumps(metadata_dict, indent=4)
+
+        # Save data to session_state
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+            zip_file.writestr(f"{slug_nano}.html", html_template)
+            zip_file.writestr(f"{slug_nano}_metadata.json", json_str)
+        zip_buffer.seek(0)
+
+        st.download_button(
+            label="📦 Download HTML + Metadata ZIP",
+            data=zip_buffer,
+            file_name=f"{story_title}.zip",
+            mime="application/zip"
+        )
+
+    except Exception as e:
+        st.error(f"Error processing HTML: {e}")
+
 with tab6:
+    # ── AWS CONFIG ────────────────────────────────────────────────────
+    AWS_ACCESS_KEY   = st.secrets["aws"]["AWS_ACCESS_KEY"]
+    AWS_SECRET_KEY   = st.secrets["aws"]["AWS_SECRET_KEY"]
+    AWS_REGION       = st.secrets["aws"]["AWS_REGION"]
+    AWS_BUCKET       = st.secrets["aws"]["AWS_BUCKET"]
+    S3_PREFIX        = st.secrets["aws"]["S3_PREFIX"]
+    CDN_BASE         = st.secrets["aws"]["CDN_BASE"]
+    CDN_PREFIX_MEDIA = "https://media.suvichaar.org/"
+    
+    # Initialize S3 client once
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id     = AWS_ACCESS_KEY,
+        aws_secret_access_key = AWS_SECRET_KEY,
+        region_name           = AWS_REGION,
+    )
+    
     st.title("Cover Image Request")
-    s3 = boto3.client("s3", aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY, region_name=AWS_REGION)
-
-    uploaded = st.file_uploader("📥 Upload Suvichaar TTS JSON", type=["json"])
+    
+    uploaded = st.file_uploader("📥 Upload Suvichaar JSON", type=["json"])
     if not uploaded:
-        st.info("Please upload TTS JSON to begin.")
+        st.info("Please upload a Suvichaar-style JSON to begin.")
         st.stop()
-
+    
+    # Parse & transform
     try:
         data = json.load(uploaded)
         transformed = {}
         for slide_key, info in data.items():
-            idx = int(slide_key.replace("slide", ""))
-            # derive text
+            idx = int(slide_key.replace("slide", "")) if slide_key.startswith("slide") else 0
+            if idx == 0:
+                continue
             if "storytitle" in info:
                 text = info["storytitle"]
             elif "hookline" in info:
                 text = info["hookline"]
             else:
-                text = next((v for k, v in info.items() if "paragraph1" in k), "")
+                text = next((v for k, v in info.items() if "paragraph" in k), "")
             audio = info.get("audio_url", "")
+    
             transformed[slide_key] = {
                 f"s{idx}paragraph1": text,
-                f"s{idx}audio1": audio,
-                f"s{idx}image1": DEFAULT_COVER_URL,
-                f"s{idx}paragraph2": "Suvichaar",
+                f"s{idx}audio1":    audio,
+                f"s{idx}image1":    DEFAULT_SLIDE_IMAGE_URL,
+                f"s{idx}paragraph2":"Suvichaar"
             }
+    
         st.success("✅ Transformation Complete")
         st.json(transformed)
+    
+    except json.JSONDecodeError:
+        st.error("❌ Uploaded file is not valid JSON.")
+        st.stop()
     except Exception as e:
         st.error(f"❌ Error during transformation: {e}")
         st.stop()
-
+    
+    # Generate thumbnail
     if st.button("Generate Thumbnail"):
         with st.spinner("Generating…"):
             try:
-                resp = requests.post("https://remotion.suvichaar.org/api/generate-news-thumbnail", json=transformed, timeout=30)
+                resp = requests.post(
+                    "https://remotion.suvichaar.org/api/generate-news-thumbnail",
+                    json=transformed,
+                    timeout=30
+                )
                 resp.raise_for_status()
             except requests.RequestException as err:
                 st.error(f"Thumbnail API error: {err}")
                 st.stop()
-
+    
         img_bytes = resp.content
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         key = f"{S3_PREFIX}cover_{ts}.png"
+    
+        # Upload without ACL
         try:
-            s3.put_object(Bucket=AWS_BUCKET, Key=key, Body=img_bytes, ContentType=resp.headers.get("Content-Type","image/png"))
+            s3.put_object(
+                Bucket      = AWS_BUCKET,
+                Key         = key,
+                Body        = img_bytes,
+                ContentType = resp.headers.get("Content-Type", "image/png"),
+            )
         except Exception as s3_err:
             st.error(f"S3 upload failed: {s3_err}")
             st.stop()
-
+    
         cdn_url = f"{CDN_PREFIX_MEDIA}{key}"
         st.success("🖼️ Thumbnail generated and uploaded!")
         st.markdown(f"[View on CDN]({cdn_url})")
         st.image(cdn_url, use_column_width=True)
-
+    
+        # Offer JSON download
         st.download_button(
-            "⬇️ Download Transformed JSON",
+            label="⬇️ Download Transformed JSON",
             data=json.dumps(transformed, indent=2, ensure_ascii=False),
             file_name=f"CoverJSON_{ts}.json",
-            mime="application/json",
+            mime="application/json"
         )
