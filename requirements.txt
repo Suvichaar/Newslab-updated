@@ -6,3 +6,4 @@ textblob
 nltk
 boto3
 lxml[html_clean]
+azure-cognitiveservices-speech
